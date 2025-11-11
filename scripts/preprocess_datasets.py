@@ -43,7 +43,6 @@ if not os.path.exists("./datasets"):
 
 INPUT_DIR = f"./datasets/{DATASET_NAME}/raw"
 OUTPUT_DIR = f"./datasets/{DATASET_NAME}/processed"
-TEMP_DIR = f"./temp" # Diretório temporário para salvar tensores parciais
 
 # Tamanho da imagem (redimensionamento padrão)
 IMAGE_SIZE = (64, 64)
@@ -299,129 +298,63 @@ def load_images_from_folder(root_dir):
 def transform(image) -> torch.Tensor:
     return TRANSFORM_COMPOSE(image)
 
-def preprocess_images(image_paths, labels):
+def preprocess_images(image_paths, labels, image_size):
     """Aplica transformações e converte para tensor normalizado."""
-    # idx_errors: list[int] = []
-    # total_images = len(image_paths)
-    # progress_bar(0, total_images, verbose_text="[...] Pré-processando imagens")
+    idx_errors = []
 
-    # # Cria os arquivos temporarios
-    # os.makedirs(TEMP_DIR, exist_ok=True)
+    def process(idx, path, lbl):
+        nonlocal tensors, label_tensors, idx_errors
+        try:
+            img = Image.open(path).convert("RGB")
+            tensor = transform(img)
+            tensors[idx] = tensor
+            label_tensors[idx] = lbl
+            img.close()
+            del img, tensor
+        except Exception as e:
+            print(f"Erro ao processar {path}: {e}")
+            tensors[idx] = torch.zeros(3, image_size[0], image_size[1])
+            label_tensors[idx] = lbl
+            # Regiao critica para adicionar o indice do erro
+            threading_lock = threading.Lock()
+            with threading_lock:
+                idx_errors.append(idx)
 
-    # processed = 0
-    # # Processa em batches para controlar uso de memória
-    # for batch_start in range(0, total_images, 1000):
-    #     batch_image_paths = image_paths[batch_start:batch_start + 1000]
-    #     batch_labels = labels[batch_start:batch_start + 1000]
+    total_images = len(image_paths)
+    i = 0
+    t = 0
+    progress_bar(i, total_images, verbose_text="[...] Pré-processando imagens")
 
-    #     batch_tensors: list[torch.Tensor] = []
-    #     batch_label_list: list[int] = []
-    #     lock = threading.Lock()
+    # Cria as listas de tensores e labels com o tamanho exato
+    tensors: list[torch.Tensor] = [torch.Tensor()] * total_images
+    label_tensors = [None] * total_images
 
-    #     # threads placeholders
-    #     threads: list[threading.Thread | None] = [None] * NUM_THREADS
+    # Cria array com NUM_THREADS para acelerar o processamento
+    threads: list[threading.Thread] = [threading.Thread()] * NUM_THREADS
 
-    #     def process(idx, path, lbl, tensors_list, labels_list, lck):
-    #         nonlocal idx_errors
-    #         try:
-    #             with Image.open(path) as img:
-    #                 img_rgb = img.convert("RGB")
-    #                 tensor = transform(img_rgb)
-    #             # Append under lock to keep order of tensors matching labels within this batch
-    #             with lck:
-    #                 tensors_list.append(tensor.cpu())
-    #                 labels_list.append(lbl)
-    #         except Exception as e:
-    #             print(f"Erro ao processar {path}: {e}")
-    #             with lck:
-    #                 idx_errors.append(idx)
+    for path, lbl in zip(image_paths, labels):
+        while threads[t].is_alive():
+            t = (t + 1) % NUM_THREADS
+            time.sleep(0.02)  # Evita busy-waiting
+        threads[t] = threading.Thread(target=process, args=(i, path, lbl))
+        threads[t].start()
+        i += 1
+        t = (t + 1) % NUM_THREADS
+        progress_bar(i, total_images, verbose_text=f"[✓] Pré-processado: {os.path.basename(path)}")
+        if (i % 500) == 0:
+            gc.collect() # Coleta de lixo periódica para liberar memória
 
-    #     t = 0
-    #     for j, (path, lbl) in enumerate(zip(batch_image_paths, batch_labels)):
-    #         global_idx = batch_start + j
-    #         # find next available thread slot
-    #         while threads[t] is not None and threads[t].is_alive():
-    #             t = (t + 1) % NUM_THREADS
-    #             time.sleep(0.02)
-    #         threads[t] = threading.Thread(target=process, args=(global_idx, path, lbl, batch_tensors, batch_label_list, lock))
-    #         threads[t].start()
-    #         t = (t + 1) % NUM_THREADS
-    #         processed += 1
-    #         progress_bar(processed, total_images, verbose_text=f"[✓] Pré-processado: {os.path.basename(path)}")
+    for thread in threads:
+        thread.join()
 
-    #     # Aguarda todas as threads do batch
-    #     for thread in threads:
-    #         if thread is not None:
-    #             thread.join()
+    for index in idx_errors:
+        print(f"[!] Imagem com erro no pré-processamento: {image_paths[index]}")
+        del tensors[index], label_tensors[index]
 
-    #     # Reporta imagens com erro desse batch
-    #     for index in idx_errors:
-    #         if batch_start <= index < batch_start + len(batch_image_paths):
-    #             print(f"[!] Imagem com erro no pré-processamento: {image_paths[index]}")
-
-    #     # Se houver tensores válidos, salva batch de tensores e labels em arquivos temporários
-    #     if len(batch_tensors) > 0:
-    #         temp_tensor = torch.stack(batch_tensors)
-    #         tmp_tfname = create_new_filename(os.path.join(TEMP_DIR, "temp_tensor.pt"))
-    #         torch.save(temp_tensor, tmp_tfname)
-    #         del temp_tensor
-
-    #         label_tensor_batch = torch.tensor(batch_label_list, dtype=torch.long)
-    #         tmp_lfname = create_new_filename(os.path.join(TEMP_DIR, "temp_labels.pt"))
-    #         torch.save(label_tensor_batch, tmp_lfname)
-    #         del label_tensor_batch
-
-    #     # libera memoria do batch
-    #     del batch_tensors, batch_label_list
-    #     gc.collect()
-
-    # Carrega todos os tensores parciais e concatena
-    print(f"[...] Carregando tensores parciais e concatenando")
-    tensor_files = sorted([os.path.join(TEMP_DIR, f) for f in os.listdir(TEMP_DIR) if "temp_tensor" in f and f.endswith(".pt")])
-    label_files = sorted([os.path.join(TEMP_DIR, f) for f in os.listdir(TEMP_DIR) if "temp_labels" in f and f.endswith(".pt")])
-
-    data_tensor = None
-    for f, fname in enumerate(tensor_files):
-        temp_tensor = torch.load(fname)
-        if data_tensor is None:
-            data_tensor = temp_tensor
-        else:
-            data_tensor = torch.cat((data_tensor, temp_tensor), dim=0)
-        del temp_tensor
-        gc.collect()
-        progress_bar(f + 1, len(tensor_files), verbose_text=f"[✓] Carregado e concatenado: {fname}")
-
-    if data_tensor is None:
-        # nenhum tensor válido
-        data_tensor = torch.empty((0,))
-        progress_bar(1, 1, verbose_text=f"[!] Nenhum tensor válido encontrado.", finished=True)
-    else:
-        progress_bar(len(tensor_files), len(tensor_files), verbose_text=f"[✓] Concatenação concluída.", finished=True)
-
-    # Carrega e concatena labels
-    progress_bar(0, len(label_files), verbose_text=f"[...] Carregando rótulos parciais e concatenando")
-    label_tensors_list: list[torch.Tensor] = []
-    for f, fname in enumerate(label_files):
-        temp_labels = torch.load(fname)
-        label_tensors_list.append(temp_labels)
-        del temp_labels
-        gc.collect()
-        progress_bar(f + 1, len(label_files), verbose_text=f"[✓] Carregado e armazenado: {fname}")
-
-    if len(label_tensors_list) > 0:
-        label_tensor = torch.cat(label_tensors_list, dim=0)
-        progress_bar(len(label_files), len(label_files), verbose_text=f"[✓] Concatenação de rótulos concluída.", finished=True)
-    else:
-        label_tensor = torch.empty((0,), dtype=torch.long)
-        progress_bar(1, 1, verbose_text=f"[!] Nenhum rótulo válido encontrado.", finished=True)
-
-    # # Limpa arquivos temporarios
-    # for f in os.listdir(TEMP_DIR):
-    #     os.remove(os.path.join(TEMP_DIR, f))
-
-    # os.rmdir(TEMP_DIR)
-
+    data_tensor = torch.stack(tensors)  # [N, C, H, W]
+    label_tensor = torch.tensor(label_tensors, dtype=torch.long)
     return data_tensor, label_tensor
+
 
 def save_split_tensors(X_train, y_train, X_test, y_test, output_dir):
     """Salva tensores em formato .pt para uso no LibTorch."""
@@ -454,8 +387,8 @@ def main():
     )
 
     # Pré-processar ambos
-    X_train_tensor, y_train_tensor = preprocess_images(X_train, y_train)
-    X_test_tensor, y_test_tensor = preprocess_images(X_test, y_test)
+    X_train_tensor, y_train_tensor = preprocess_images(X_train, y_train, IMAGE_SIZE)
+    X_test_tensor, y_test_tensor = preprocess_images(X_test, y_test, IMAGE_SIZE)
 
     # Salvar tensores
     save_split_tensors(X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, OUTPUT_DIR)
