@@ -298,26 +298,55 @@ def load_images_from_folder(root_dir):
 def transform(image) -> torch.Tensor:
     return TRANSFORM_COMPOSE(image)
 
-def preprocess_images(image_paths, labels, image_size):
-    """Aplica transformações e converte para tensor normalizado."""
+def preprocess_images(image_paths, labels, image_size, use_memmap: bool = False, data_memmap=None, label_memmap=None, memmap_start: int = 0):
+    """Aplica transformações e converte para tensor normalizado.
+
+    Se use_memmap for True, escreve diretamente nas memmaps numpy fornecidas:
+      - data_memmap: numpy.memmap shape (N, 3, H, W) dtype=np.float32
+      - label_memmap: numpy.memmap shape (N,) dtype=np.int64
+    Caso contrário, aloca e retorna tensores torch (comportamento anterior).
+    """
     idx_errors = []
+    idx_errors_lock = threading.Lock()
 
     def process(idx, path, lbl):
-        nonlocal tensors, label_tensors, idx_errors
+        nonlocal data_tensor, label_tensor, idx_errors
         try:
             img = Image.open(path).convert("RGB")
             tensor = transform(img)
-            tensors[idx] = tensor
-            label_tensors[idx] = lbl
+            if tensor.dim() == 4:
+                tensor = tensor.squeeze(0)
+
+            if use_memmap:
+                # tensor é CPU float32 contíguo; .numpy() irá expor o buffer
+                np_arr = tensor.numpy()
+                if (data_memmap is None) or (label_memmap is None):
+                    raise ValueError("Memmaps não fornecidas para escrita.")
+                data_memmap[memmap_start + idx] = np_arr
+                label_memmap[memmap_start + idx] = int(lbl)
+            else:
+                # Copia diretamente para o tensor pré-alocado para evitar muitos objetos temporários
+                if data_tensor is None or label_tensor is None:
+                    raise ValueError("Tensores não foram alocados corretamente.")
+                data_tensor[idx].copy_(tensor)
+                label_tensor[idx] = int(lbl)
+
             img.close()
             del img, tensor
         except Exception as e:
             print(f"Erro ao processar {path}: {e}")
-            tensors[idx] = torch.zeros(3, image_size[0], image_size[1])
-            label_tensors[idx] = lbl
-            # Regiao critica para adicionar o indice do erro
-            threading_lock = threading.Lock()
-            with threading_lock:
+            if use_memmap:
+                # Zera slot problemático
+                if (data_memmap is None) or (label_memmap is None):
+                    raise ValueError("Memmaps não fornecidas para escrita.")
+                data_memmap[memmap_start + idx].fill(0)
+                label_memmap[memmap_start + idx] = int(lbl)
+            else:
+                if data_tensor is None or label_tensor is None:
+                    raise ValueError("Tensores não foram alocados corretamente.")
+                data_tensor[idx].zero_()
+                label_tensor[idx] = int(lbl)
+            with idx_errors_lock:
                 idx_errors.append(idx)
 
     total_images = len(image_paths)
@@ -325,35 +354,63 @@ def preprocess_images(image_paths, labels, image_size):
     t = 0
     progress_bar(i, total_images, verbose_text="[...] Pré-processando imagens")
 
-    # Cria as listas de tensores e labels com o tamanho exato
-    tensors: list[torch.Tensor] = [torch.Tensor()] * total_images
-    label_tensors = [None] * total_images
+    if not use_memmap:
+        # Aloca buffers grandes para evitar listas de tensores (economiza overhead e referências)
+        data_tensor: torch.Tensor | None = torch.empty((total_images, 3, image_size[0], image_size[1]), dtype=torch.float32)
+        label_tensor: torch.Tensor | None = torch.empty((total_images,), dtype=torch.long)
+    else:
+        # placeholders para a clausula "nonlocal" no process
+        data_tensor: torch.Tensor | None = None
+        label_tensor: torch.Tensor | None = None
 
-    # Cria array com NUM_THREADS para acelerar o processamento
-    threads: list[threading.Thread] = [threading.Thread()] * NUM_THREADS
+    # Inicializa slots de threads
+    threads: list[threading.Thread] = []
 
     for path, lbl in zip(image_paths, labels):
-        while threads[t].is_alive():
-            t = (t + 1) % NUM_THREADS
-            time.sleep(0.02)  # Evita busy-waiting
-        threads[t] = threading.Thread(target=process, args=(i, path, lbl))
+        if len(threads) < NUM_THREADS:
+            threads.append(threading.Thread(target=process, args=(i, path, lbl), daemon=True))
+        elif len(threads) > NUM_THREADS:
+            raise RuntimeError("Número de threads excedeu o limite definido.")
+        else:
+            while threads[t] is not None and threads[t].is_alive():
+                t = (t + 1) % NUM_THREADS
+                time.sleep(0.02)  # Evita busy-waiting
+            threads[t] = threading.Thread(target=process, args=(i, path, lbl), daemon=True)
         threads[t].start()
         i += 1
         t = (t + 1) % NUM_THREADS
         progress_bar(i, total_images, verbose_text=f"[✓] Pré-processado: {os.path.basename(path)}")
         if (i % 500) == 0:
-            gc.collect() # Coleta de lixo periódica para liberar memória
+            gc.collect()  # Coleta de lixo periódica para liberar memória
 
     for thread in threads:
-        thread.join()
+        if thread is not None:
+            thread.join()
 
-    for index in idx_errors:
-        print(f"[!] Imagem com erro no pré-processamento: {image_paths[index]}")
-        del tensors[index], label_tensors[index]
+    if idx_errors:
+        for index in idx_errors:
+            print(f"[!] Imagem com erro no pré-processamento: {image_paths[index]}")
+        # Filtra imagens com erro para evitar linhas inválidas
+        if not use_memmap:
+            valid_mask = torch.ones(total_images, dtype=torch.bool)
+            for index in idx_errors:
+                valid_mask[index] = False
+            if valid_mask.sum().item() == 0:
+                raise RuntimeError("Todas as imagens falharam no pré-processamento.")
+            if data_tensor is None or label_tensor is None:
+                raise ValueError("Tensores não foram alocados corretamente.")
+            data_tensor = data_tensor[valid_mask]
+            label_tensor = label_tensor[valid_mask]
+        else:
+            # Se usou memmap, opcionalmente poderia recompactar os arquivos em disco. Simplesmente
+            # deixamos os slots zerados e retornamos os índices válidos via slicing feito pelo chamador.
+            pass
 
-    data_tensor = torch.stack(tensors)  # [N, C, H, W]
-    label_tensor = torch.tensor(label_tensors, dtype=torch.long)
-    return data_tensor, label_tensor
+    if use_memmap:
+        # Retorna None (os dados ficam nas memmaps passadas) e a máscara de erros para o chamador aplicar
+        return None, None, idx_errors
+    else:
+        return data_tensor, label_tensor, idx_errors
 
 
 def save_split_tensors(X_train, y_train, X_test, y_test, output_dir):
@@ -386,9 +443,62 @@ def main():
         images, labels, train_size=TRAIN_RATIO, random_state=SEED, stratify=labels
     )
 
-    # Pré-processar ambos
-    X_train_tensor, y_train_tensor = preprocess_images(X_train, y_train, IMAGE_SIZE)
-    X_test_tensor, y_test_tensor = preprocess_images(X_test, y_test, IMAGE_SIZE)
+    # Se o dataset for grande demais para a RAM, usamos numpy.memmap para escrever em disco em blocos.
+    # Estimativa simples do tamanho (bytes) necessário para imagens float32: N * 3 * H * W * 4
+    est_train_bytes = len(X_train) * 3 * IMAGE_SIZE[0] * IMAGE_SIZE[1] * 4
+    est_test_bytes = len(X_test) * 3 * IMAGE_SIZE[0] * IMAGE_SIZE[1] * 4
+    MEMMAP_THRESHOLD = 1 << 30  # 1 GiB, ajuste conforme sua máquina
+
+    use_memmap = (est_train_bytes > MEMMAP_THRESHOLD) or (est_test_bytes > MEMMAP_THRESHOLD)
+
+    if use_memmap:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        # Cria memmaps para treino e teste
+        import numpy as _np
+        train_data_path = os.path.join(OUTPUT_DIR, "train_images.memmap")
+        train_label_path = os.path.join(OUTPUT_DIR, "train_labels.memmap")
+        test_data_path = os.path.join(OUTPUT_DIR, "test_images.memmap")
+        test_label_path = os.path.join(OUTPUT_DIR, "test_labels.memmap")
+
+        X_train_mem = _np.memmap(train_data_path, dtype=_np.float32, mode='w+', shape=(len(X_train), 3, IMAGE_SIZE[0], IMAGE_SIZE[1]))
+        y_train_mem = _np.memmap(train_label_path, dtype=_np.int64, mode='w+', shape=(len(X_train),))
+        X_test_mem = _np.memmap(test_data_path, dtype=_np.float32, mode='w+', shape=(len(X_test), 3, IMAGE_SIZE[0], IMAGE_SIZE[1]))
+        y_test_mem = _np.memmap(test_label_path, dtype=_np.int64, mode='w+', shape=(len(X_test),))
+
+        # Processa escrevendo direto nas memmaps
+        _, _, train_errors = preprocess_images(X_train, y_train, IMAGE_SIZE, use_memmap=True, data_memmap=X_train_mem, label_memmap=y_train_mem, memmap_start=0)
+        _, _, test_errors = preprocess_images(X_test, y_test, IMAGE_SIZE, use_memmap=True, data_memmap=X_test_mem, label_memmap=y_test_mem, memmap_start=0)
+
+        # Se houver erros, opcionalmente recompactar (filtrar índices) — aqui criamos tensores a partir das memmaps
+        import numpy as _np
+        if train_errors:
+            mask = _np.ones(len(X_train), dtype=bool)
+            mask[train_errors] = False
+            X_train_arr = X_train_mem[mask]
+            y_train_arr = y_train_mem[mask]
+        else:
+            X_train_arr = X_train_mem
+            y_train_arr = y_train_mem
+
+        if test_errors:
+            mask = _np.ones(len(X_test), dtype=bool)
+            mask[test_errors] = False
+            X_test_arr = X_test_mem[mask]
+            y_test_arr = y_test_mem[mask]
+        else:
+            X_test_arr = X_test_mem
+            y_test_arr = y_test_mem
+
+        # Converte para torch sem copiar desnecessariamente (torch.from_numpy compartilha buffer)
+        X_train_tensor = torch.from_numpy(_np.asarray(X_train_arr))
+        y_train_tensor = torch.from_numpy(_np.asarray(y_train_arr)).long()
+        X_test_tensor = torch.from_numpy(_np.asarray(X_test_arr))
+        y_test_tensor = torch.from_numpy(_np.asarray(y_test_arr)).long()
+
+    else:
+        # Pré-processar ambos em RAM (comportamento anterior)
+        X_train_tensor, y_train_tensor, _ = preprocess_images(X_train, y_train, IMAGE_SIZE)
+        X_test_tensor, y_test_tensor, _ = preprocess_images(X_test, y_test, IMAGE_SIZE)
 
     # Salvar tensores
     save_split_tensors(X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, OUTPUT_DIR)
@@ -397,9 +507,10 @@ def main():
     meta = {
         "classes": classes,
         "image_size": IMAGE_SIZE,
-        "train_size": len(y_train_tensor),
-        "test_size": len(y_test_tensor),
-        "seed": SEED
+        "train_size": len(y_train_tensor) if y_train_tensor is not None else 0,  
+        "test_size": len(y_test_tensor) if y_test_tensor is not None else 0,  
+        "seed": SEED,
+        "memmap_used": use_memmap
     }
     torch.save(meta, os.path.join(OUTPUT_DIR, "metadata.pt"))
     print("Metadados salvos com sucesso.")
