@@ -1,35 +1,42 @@
-cmake_minimum_required(VERSION 3.16)
-project(torch_cpp_float_benchmark)
+cmake_minimum_required(VERSION 3.13 FATAL_ERROR)
+project(torch_cpp_precision_experiment VERSION 1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # LibTorch
-find_package(Torch REQUIRED)
 set(CMAKE_PREFIX_PATH "./include/libtorch")
+find_package(Torch REQUIRED)
 
-# LIKWID
-find_library(LIKWID_LIB likwid REQUIRED)
-include_directories(/usr/local/include)
+# # LIKWID
+# find_library(LIKWID_LIB likwid REQUIRED)
+# include_directories(/usr/local/include)
 
 # Adiciona a definição para habilitar os marcadores do LIKWID
-add_definitions(-DLIKWID_PERFMON)
+# add_definitions(-DLIKWID_PERFMON)
 
 # Fontes
 set(SOURCES
-    main.cpp
-    net/net.cpp
-    net/net.h
-    net/linear_custom.h
+    src/main.cpp
     include/utils.h
-    data/pklot_loader.h
-    benchmark/benchmark.h
+    include/Net.hpp
 )
 
-add_executable(${PROJECT_NAME} ${SOURCES})
+set(EXEC_NAME "cnn_experiment")
 
-# Linka Torch e LIKWID
-target_link_libraries(${PROJECT_NAME} "${TORCH_LIBRARIES}" ${LIKWID_LIB})
+add_executable(${EXEC_NAME} ${SOURCES})
+
+target_include_directories(${EXEC_NAME} PRIVATE include)
+
+# Linka Torch
+target_compile_definitions(${EXEC_NAME} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+target_link_libraries(${EXEC_NAME} "${TORCH_LIBRARIES}")
 
 # Garante que o padrão seja C++17
-set_property(TARGET ${PROJECT_NAME} PROPERTY CXX_STANDARD 17)
+set_property(TARGET ${EXEC_NAME} PROPERTY CXX_STANDARD 17)
+
+# Para evitar warnings de linking em algumas plataformas
+if (UNIX)
+  target_link_libraries(${EXEC_NAME} pthread)
+endif()
