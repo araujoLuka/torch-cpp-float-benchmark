@@ -18,8 +18,7 @@ find_package(Torch REQUIRED)
 
 # Fontes
 set(SOURCES
-    src/main.cpp
-    include/utils.h
+    source/main.cpp
     include/Net.hpp
 )
 
@@ -40,3 +39,9 @@ set_property(TARGET ${EXEC_NAME} PROPERTY CXX_STANDARD 17)
 if (UNIX)
   target_link_libraries(${EXEC_NAME} pthread)
 endif()
+
+# Argumentos para debug
+set_target_properties(${EXEC_NAME} PROPERTIES
+    VS_DEBUGGER_COMMAND_ARGUMENTS "--dataset Fruits360 --data_root ${CMAKE_SOURCE_DIR}/datasets"
+    VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+)
