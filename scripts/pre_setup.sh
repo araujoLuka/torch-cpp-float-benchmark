@@ -7,7 +7,7 @@
 # Global Variables
 # ---------------------------------------------------------------
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
-LIBTORCH_URL="https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.6.0%2Bcpu.zip"
+LIBTORCH_URL="https://download.pytorch.org/libtorch/cu126/libtorch-shared-with-deps-2.9.1%2Bcu126.zip"
 LIBTORCH_DIR="$SCRIPT_DIR/../include"
 
 # ---------------------------------------------------------------
