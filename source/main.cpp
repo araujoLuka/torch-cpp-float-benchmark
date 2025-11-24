@@ -1,8 +1,10 @@
 #include <ATen/core/Dict.h>
 #include <torch/torch.h>
 #include <torch/serialize.h>
+#include <torch/script.h>
 #include <iostream>
 #include <chrono>
+#include <memory>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -25,9 +27,9 @@ namespace fs = std::filesystem;
 // ----------------- CLI -----------------
 struct Args {
     std::string dataset;               // obrigatório: Fruits360 | PKLot
-    std::string data_root = "./datasets";
+    std::string data_root = "./data/datasets";
     int64_t epochs = 10;
-    int64_t batch_size = 32;
+    int64_t batch_size = 512;
     double lr = 1e-3;
     int64_t seed = 42;
     std::string dtype_arg = "float32"; // float64|float32|float16|bfloat16
@@ -43,6 +45,25 @@ static void print_usage() {
         << "Usage: ./app --dataset Fruits360|PKLot [--data_root DIR] [--epochs N] [--batch_size N]\n"
         << "             [--lr LR] [--dtype float64|float32|float16|bfloat16] [--seed S]\n"
         << "             [--use_dropout] [--max_ram_mb MB] [--load_model PATH] [--load_state PATH]\n";
+}
+
+static void print_help() {
+    print_usage();
+    std::cerr
+        << "\n"
+        << "Options:\n"
+        << "  --dataset         Dataset name (Fruits360 or PKLot) [required]\n"
+        << "  --data_root      Root directory for datasets (default: ./data/datasets)\n"
+        << "  --epochs         Number of training epochs (default: 10)\n"
+        << "  --batch_size     Mini-batch size (default: 512)\n"
+        << "  --lr             Learning rate (default: 1e-3)\n"
+        << "  --dtype          Data type: float64, float32, float16, bfloat16 (default: float32)\n"
+        << "  --seed           Random seed (default: 42)\n"
+        << "  --use_dropout    Use dropout layer before fully connected layers\n"
+        << "  --max_ram_mb     Max RAM in MB before using memmap fallback (default: 2048)\n"
+        << "  --load_model     Path to load full TorchScript Module\n"
+        << "  --load_state     Path to load state_dict saved from Python\n"
+        << "  --cpu            Force using CPU even if GPU is available\n";
 }
 
 static std::optional<Args> parse_args(int argc, char** argv) {
@@ -64,13 +85,13 @@ static std::optional<Args> parse_args(int argc, char** argv) {
         else if (k == "--cpu") { a.force_cpu = true; }
         else {
             std::cerr << "Unknown or incomplete arg: " << k << "\n";
-            print_usage();
+            print_help();
             return std::nullopt;
         }
     }
     if (a.dataset.empty()) {
         std::cerr << "[!] --dataset is required.\n";
-        print_usage();
+        print_help();
         return std::nullopt;
     }
     return a;
@@ -318,114 +339,97 @@ struct DatasetPack {
     std::unique_ptr<ILoader> test_loader;
 };
 
+// Decide backend por split (memmap ou .pt) e cria o LoaderHolder apropriado
+static std::unique_ptr<ILoader> make_split_loader(
+    const Args& args,
+    const MetaInfo& meta,
+    const fs::path& processed_dir,
+    const std::string& split_name,
+    int64_t split_size,
+    const torch::data::DataLoaderOptions& opts) {
+
+    const int64_t C = 3;
+    const int64_t H = meta.image_h;
+    const int64_t W = meta.image_w;
+
+    auto bytes_for_split = [&](int64_t n) {
+        return bytes_for_tensor(n, C, H, W, 1) + bytes_for_labels(n, 8);
+    };
+
+    fs::path images_pt = processed_dir / (split_name + "_images.pt");
+    fs::path labels_pt = processed_dir / (split_name + "_labels.pt");
+    fs::path images_mm = processed_dir / (split_name + "_images.memmap");
+    fs::path labels_mm = processed_dir / (split_name + "_labels.memmap");
+
+    bool have_memmap = fs::exists(images_mm) && fs::exists(labels_mm) && split_size > 0;
+
+    bool use_memmap = false;
+    if (have_memmap) {
+        auto bytes = bytes_for_split(split_size);
+        auto mb = bytes / (1024 * 1024);
+        use_memmap = (mb > args.max_ram_mb);
+    }
+
+    if (use_memmap) {
+        auto dm = std::make_shared<MMap>(MMap::map_file(images_mm.string(), false));
+        auto lm = std::make_shared<MMap>(MMap::map_file(labels_mm.string(), false));
+        auto ds = MemmapTensorDataset(dm, lm, split_size, C, H, W);
+        auto map = ds.map(torch::data::transforms::Stack<>());
+        auto loader = torch::data::make_data_loader(std::move(map), opts);
+        using LoaderT = std::remove_reference_t<decltype(*loader)>;
+        return std::make_unique<LoaderHolder<LoaderT>>(std::move(loader));
+    }
+
+    torch::Tensor X, Y;
+    X = load_tensor_pickle(images_pt);
+    Y = load_tensor_pickle(labels_pt);
+    if (X.dtype() != torch::kUInt8) X = X.to(torch::kUInt8);
+    if (Y.dtype() != torch::kInt64) Y = Y.to(torch::kInt64);
+
+    auto ds = InMemoryTensorDataset(X, Y);
+    auto map = ds.map(torch::data::transforms::Stack<>());
+    auto loader = torch::data::make_data_loader(std::move(map), opts);
+    using LoaderT = std::remove_reference_t<decltype(*loader)>;
+    return std::make_unique<LoaderHolder<LoaderT>>(std::move(loader));
+}
+
 // build_loaders mantém lógica, mas usa make_data_loader corretamente e encapsula em LoaderHolder
 static DatasetPack build_loaders(const Args& args, const MetaInfo& meta,
-                                 const fs::path& processed_dir,
-                                 bool& used_memmap_backend_out) {
-    auto train_images_pt = processed_dir / "train_images.pt";
-    auto train_labels_pt = processed_dir / "train_labels.pt";
-    auto val_images_pt   = processed_dir / "val_images.pt";
-    auto val_labels_pt   = processed_dir / "val_labels.pt";
-    auto test_images_pt  = processed_dir / "test_images.pt";
-    auto test_labels_pt  = processed_dir / "test_labels.pt";
-
-    auto train_images_mm = processed_dir / "train_images.memmap";
-    auto train_labels_mm = processed_dir / "train_labels.memmap";
-    auto val_images_mm   = processed_dir / "val_images.memmap";
-    auto val_labels_mm   = processed_dir / "val_labels.memmap";
-    auto test_images_mm  = processed_dir / "test_images.memmap";
-    auto test_labels_mm  = processed_dir / "test_labels.memmap";
-
+                                 const fs::path& processed_dir) {
     const int64_t C = 3, H = meta.image_h, W = meta.image_w;
-    int64_t train_bytes = bytes_for_tensor(meta.train_size, C, H, W, 1) + bytes_for_labels(meta.train_size, 8);
-    int64_t val_bytes   = bytes_for_tensor(meta.val_size,   C, H, W, 1) + bytes_for_labels(meta.val_size,   8);
-    int64_t test_bytes  = bytes_for_tensor(meta.test_size,  C, H, W, 1) + bytes_for_labels(meta.test_size,  8);
-    int64_t total_mb = (train_bytes + val_bytes + test_bytes) / (1024*1024);
+    auto bytes_for_split = [&](int64_t n) {
+        return bytes_for_tensor(n, C, H, W, 1) + bytes_for_labels(n, 8);
+    };
 
-    bool memmap_available =
-        fs::exists(train_images_mm) && fs::exists(train_labels_mm) &&
-        fs::exists(val_images_mm)   && fs::exists(val_labels_mm)   &&
-        fs::exists(test_images_mm)  && fs::exists(test_labels_mm);
+    int64_t train_bytes = bytes_for_split(meta.train_size);
+    int64_t val_bytes   = bytes_for_split(meta.val_size);
+    int64_t test_bytes  = bytes_for_split(meta.test_size);
+    int64_t total_mb = (train_bytes + val_bytes + test_bytes) / (1024 * 1024);
 
-    bool force_memmap = (total_mb > args.max_ram_mb) && memmap_available;
-    used_memmap_backend_out = force_memmap;
+    std::cout << "[i] Estimated total dataset size ~" << total_mb
+              << "MB (limit max_ram_mb=" << args.max_ram_mb << ")\n";
 
     torch::data::DataLoaderOptions opts;
     opts.batch_size(args.batch_size).workers(0);
 
     DatasetPack pack;
 
-    if (force_memmap) {
-        std::cout << "[i] Using memmap backend (est " << total_mb << "MB > " << args.max_ram_mb << "MB)\n";
-        auto tr_dm = std::make_shared<MMap>(MMap::map_file(train_images_mm.string(), false));
-        auto tr_lm = std::make_shared<MMap>(MMap::map_file(train_labels_mm.string(), false));
-        auto va_dm = std::make_shared<MMap>(MMap::map_file(val_images_mm.string(),   false));
-        auto va_lm = std::make_shared<MMap>(MMap::map_file(val_labels_mm.string(),   false));
-        auto te_dm = std::make_shared<MMap>(MMap::map_file(test_images_mm.string(),  false));
-        auto te_lm = std::make_shared<MMap>(MMap::map_file(test_labels_mm.string(),  false));
+    struct SplitInfo {
+        const char* name;
+        int64_t size;
+        std::unique_ptr<ILoader>* target;
+    };
 
-        auto train_ds = MemmapTensorDataset(tr_dm, tr_lm, meta.train_size, C, H, W);
-        auto val_ds   = MemmapTensorDataset(va_dm, va_lm, meta.val_size,   C, H, W);
-        auto test_ds  = MemmapTensorDataset(te_dm, te_lm, meta.test_size,  C, H, W);
+    SplitInfo splits[] = {
+        {"train", meta.train_size, &pack.train_loader},
+        {"val",   meta.val_size,   &pack.val_loader},
+        {"test",  meta.test_size,  &pack.test_loader},
+    };
 
-        auto train_map = train_ds.map(torch::data::transforms::Stack<>());
-        auto val_map   = val_ds.map(torch::data::transforms::Stack<>());
-        auto test_map  = test_ds.map(torch::data::transforms::Stack<>());
-
-        auto train_loader = torch::data::make_data_loader(std::move(train_map), opts);
-        auto val_loader   = torch::data::make_data_loader(std::move(val_map), opts);
-        auto test_loader  = torch::data::make_data_loader(std::move(test_map), opts);
-
-        using TrainLoaderT = std::remove_reference_t<decltype(*train_loader)>;
-        using ValLoaderT   = std::remove_reference_t<decltype(*val_loader)>;
-        using TestLoaderT  = std::remove_reference_t<decltype(*test_loader)>;
-
-        // Tipos são iguais (mesma cadeia de templates) dentro do ramo; podemos reusar o typedef
-        pack.train_loader = std::make_unique<LoaderHolder<TrainLoaderT>>(std::move(train_loader));
-        pack.val_loader   = std::make_unique<LoaderHolder<ValLoaderT>>(std::move(val_loader));
-        pack.test_loader  = std::make_unique<LoaderHolder<TestLoaderT>>(std::move(test_loader));
-    } else {
-        std::cout << "[i] Using .pt in-memory backend (est " << total_mb << "MB <= " << args.max_ram_mb << ")\n";
-        torch::Tensor trX, trY, vaX, vaY, teX, teY;
-        try {
-            trX = load_tensor_pickle(train_images_pt);
-            trY = load_tensor_pickle(train_labels_pt);
-            vaX = load_tensor_pickle(val_images_pt);
-            vaY = load_tensor_pickle(val_labels_pt);
-            teX = load_tensor_pickle(test_images_pt);
-            teY = load_tensor_pickle(test_labels_pt);
-        } catch (const std::exception& e) {
-            std::cerr << "[!] Failed to load dataset tensors: " << e.what() << "\n";
-            throw;
-        }
-        // Garante apenas dtypes base corretos; mantém imagens em uint8 em RAM
-        if (trX.dtype() != torch::kUInt8) trX = trX.to(torch::kUInt8);
-        if (vaX.dtype() != torch::kUInt8) vaX = vaX.to(torch::kUInt8);
-        if (teX.dtype() != torch::kUInt8) teX = teX.to(torch::kUInt8);
-        if (trY.dtype() != torch::kInt64) trY = trY.to(torch::kInt64);
-        if (vaY.dtype() != torch::kInt64) vaY = vaY.to(torch::kInt64);
-        if (teY.dtype() != torch::kInt64) teY = teY.to(torch::kInt64);
-
-        auto train_ds = InMemoryTensorDataset(trX, trY);
-        auto val_ds   = InMemoryTensorDataset(vaX, vaY);
-        auto test_ds  = InMemoryTensorDataset(teX, teY);
-
-        auto train_map = train_ds.map(torch::data::transforms::Stack<>());
-        auto val_map   = val_ds.map(torch::data::transforms::Stack<>());
-        auto test_map  = test_ds.map(torch::data::transforms::Stack<>());
-
-        auto train_loader = torch::data::make_data_loader(std::move(train_map), opts);
-        auto val_loader   = torch::data::make_data_loader(std::move(val_map), opts);
-        auto test_loader  = torch::data::make_data_loader(std::move(test_map), opts);
-
-        using TrainLoaderT = std::remove_reference_t<decltype(*train_loader)>;
-        using ValLoaderT   = std::remove_reference_t<decltype(*val_loader)>;
-        using TestLoaderT  = std::remove_reference_t<decltype(*test_loader)>;
-
-        pack.train_loader = std::make_unique<LoaderHolder<TrainLoaderT>>(std::move(train_loader));
-        pack.val_loader   = std::make_unique<LoaderHolder<ValLoaderT>>(std::move(val_loader));
-        pack.test_loader  = std::make_unique<LoaderHolder<TestLoaderT>>(std::move(test_loader));
+    for (const auto& s : splits) {
+        *(s.target) = make_split_loader(args, meta, processed_dir, s.name, s.size, opts);
     }
+
     return pack;
 }
 
@@ -504,6 +508,28 @@ static double eval_accuracy(Net& model, ILoader& loader_iface,
     return (total == 0) ? 0.0 : static_cast<double>(correct) / static_cast<double>(total);
 }
 
+static void save_state_dict_json(const Net& model, const std::string& path) {
+    using nlohmann::json;
+    json root;
+
+    for (const auto& p : model->named_parameters()) {
+        const auto& name = p.key();
+        const auto& tensor = p.value().cpu();
+
+        json entry;
+        entry["shape"] = tensor.sizes().vec();
+
+        std::vector<float> data(tensor.numel());
+        std::memcpy(data.data(), tensor.data_ptr(), tensor.numel() * sizeof(float));
+        entry["data"] = data;
+
+        root[name] = entry;
+    }
+
+    std::ofstream f(path);
+    f << root.dump(2);
+}
+
 // ----------------- Main -----------------
 int main(int argc, char** argv) {
     auto pargs = parse_args(argc, argv);
@@ -544,19 +570,18 @@ int main(int argc, char** argv) {
               << " train=" << meta.train_size << " test=" << meta.test_size
               << " memmap_present=" << std::boolalpha << meta.memmap_train << "\n";
 
-    bool used_memmap_backend = false;
-    auto loaders = build_loaders(args, meta, processed_dir, used_memmap_backend);
+    auto loaders = build_loaders(args, meta, processed_dir);
 
     // Build model
-    Net model(dtype, device, /*in_channels=*/3, /*num_classes=*/meta.num_classes, args.use_dropout, /*base_filters=*/32);
+    std::shared_ptr<Net> model = std::make_shared<Net>(dtype, device, /*in_channels=*/3, /*num_classes=*/meta.num_classes, args.use_dropout, /*base_filters=*/32);
 
     // Load pretrained if provided
     if (!args.load_model.empty()) {
         try {
-            torch::load(model, args.load_model);
+            torch::load(*model, args.load_model);
             std::cout << "[i] Loaded full Module from: " << args.load_model << "\n";
             // Ensure dtype/device set as requested after load
-            model->to_dtype(dtype, device);
+            model->get()->to_dtype(dtype, device);
         } catch (const std::exception& e) {
             std::cerr << "[!] Failed to load full model: " << e.what() << "\n";
             return 3;
@@ -565,9 +590,9 @@ int main(int argc, char** argv) {
         try {
             torch::serialize::InputArchive archive;
             archive.load_from(args.load_state);
-            model->load(archive);
+            model->get()->load(archive);
             std::cout << "[i] Loaded state_dict from: " << args.load_state << "\n";
-            model->to_dtype(dtype, device);
+            model->get()->to_dtype(dtype, device);
         } catch (const std::exception& e) {
             std::cerr << "[!] Failed to load state_dict: " << e.what() << "\n";
             return 3;
@@ -575,18 +600,18 @@ int main(int argc, char** argv) {
     }
 
     // Optimizer and loss
-    torch::optim::Adam optimizer(model->parameters(), torch::optim::AdamOptions(args.lr));
+    torch::optim::Adam optimizer(model->get()->parameters(), torch::optim::AdamOptions(args.lr));
     auto criterion = torch::nn::CrossEntropyLoss();
 
     std::cout << "Training started. dtype=" << args.dtype_arg
               << " epochs=" << args.epochs
               << " batch_size=" << args.batch_size
-              << " backend=" << (used_memmap_backend ? "memmap" : "pt") << "\n";
+              << "\n";
 
     auto t_start = std::chrono::steady_clock::now();
 
     for (int64_t epoch = 1; epoch <= args.epochs; ++epoch) {
-        model->train();
+        model->get()->train();
         double epoch_loss_sum = 0.0;
         int64_t seen = 0;
 
@@ -615,7 +640,7 @@ int main(int argc, char** argv) {
             if (inputs.dtype() != dtype) inputs = inputs.to(dtype);
 
             optimizer.zero_grad();
-            auto outputs = model->forward(inputs);
+            auto outputs = model->get()->forward(inputs);
             auto loss = criterion(outputs, labels);
             loss.backward();
             optimizer.step();
@@ -625,8 +650,8 @@ int main(int argc, char** argv) {
         }
 
         double train_loss = (seen > 0) ? (epoch_loss_sum / static_cast<double>(seen)) : 0.0;
-        double val_loss = eval_epoch(model, *loaders.val_loader, criterion, device, dtype, meta);
-        double val_acc  = eval_accuracy(model, *loaders.val_loader, device, dtype, meta);
+        double val_loss = eval_epoch(*model, *loaders.val_loader, criterion, device, dtype, meta);
+        double val_acc  = eval_accuracy(*model, *loaders.val_loader, device, dtype, meta);
 
         std::cout << "Epoch " << epoch
                   << " | train_loss=" << train_loss
@@ -640,19 +665,47 @@ int main(int argc, char** argv) {
     std::cout << "Training finished. Total time ms=" << total_ms << "\n";
 
     // Final test
-    double test_loss = eval_epoch(model, *loaders.test_loader, criterion, device, dtype, meta);
-    double test_acc  = eval_accuracy(model, *loaders.test_loader, device, dtype, meta);
+    double test_loss = eval_epoch(*model, *loaders.test_loader, criterion, device, dtype, meta);
+    double test_acc  = eval_accuracy(*model, *loaders.test_loader, device, dtype, meta);
     std::cout << "Test loss=" << test_loss << " test_acc=" << test_acc << "\n";
+
+    // Define model and JSON save paths
+    fs::path model_dir = fs::path(args.data_root) / ".." / "models" / args.dataset / "test";
+    fs::create_directories(model_dir);
+    fs::path model_path = model_dir / "model_full.pt";
+    fs::path state_dict_path = model_dir / "state_dict.json";
+    fs::path metrics_path = model_dir / "metrics.json";
+
+    // Save evaluation metrics to JSON alongside the model
+    try {
+        nlohmann::json jres;
+        jres["dataset"] = args.dataset;
+        jres["dtype"] = args.dtype_arg;
+        jres["epochs"] = args.epochs;
+        jres["batch_size"] = args.batch_size;
+        jres["lr"] = args.lr;
+        jres["test_loss"] = test_loss;
+        jres["test_acc"] = test_acc;
+        std::ofstream jm(metrics_path);
+        jm << jres.dump(4) << std::endl;
+        std::cout << "[i] Saved metrics to " << metrics_path << "\n";
+    } catch (const std::exception& e) {
+        std::cerr << "[!] Failed to save metrics: " << e.what() << "\n";
+    }
 
     // Save model
     try {
-        torch::save(model, "model_full.pt");
-        torch::serialize::OutputArchive archive;
-        model->save(archive);
-        archive.save_to("model_state_dict.pt");
-        std::cout << "[i] Saved model_full.pt and model_state_dict.pt\n";
+        torch::save(*model, model_path.string());
+        std::cout << "[i] Saved " << model_path << "\n";
     } catch (const std::exception& e) {
         std::cerr << "[!] Failed to save model: " << e.what() << "\n";
+    }
+
+    try {
+        save_state_dict_json(*model, state_dict_path.string());
+        std::cout << "[i] Saved model state_dict to " << state_dict_path << "\n";
+    } catch (const std::exception& e) {
+        std::cerr << "[!] Failed to save state_dict: " << e.what() << "\n";
     }
 
     return 0;
