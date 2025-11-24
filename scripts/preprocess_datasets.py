@@ -13,14 +13,15 @@ Saídas:
 
 import gc
 import os
-import numpy as np
+import signal
 import threading
 import time
-import signal
-import torch
-from PIL import Image
-from torchvision.transforms import v2
+import numpy as np
 from sklearn.model_selection import train_test_split
+from torch import Tensor, empty, save, from_numpy, ones, manual_seed
+from torch import uint8 as uint8_t, long as uint64_t, bool as bool_t
+from torchvision.transforms import v2
+from torchvision.io import decode_image
 
 # ==============================
 # 🔧 CONFIGURAÇÕES DO SCRIPT
@@ -60,7 +61,7 @@ GLOBAL_TEST_RATIO = 0.2
 
 # Seed para reprodutibilidade
 SEED = 42
-torch.manual_seed(SEED)
+manual_seed(SEED)
 np.random.seed(SEED)
 
 VERBOSE = True
@@ -68,8 +69,7 @@ VERBOSE = True
 NUM_THREADS: int = 4
 
 TRANSFORM_COMPOSE = v2.Compose([
-    v2.Resize(IMAGE_SIZE),
-    v2.ToImage(),  # Mantém em uint8 [0, 255]
+    v2.Resize(IMAGE_SIZE, interpolation=v2.InterpolationMode.BILINEAR, antialias=True),
 ])
 
 RETURN_TOKEN = '\r'
@@ -77,6 +77,18 @@ LINE_ABOVE_TOKEN = '\033[F'
 LINE_BELOW_TOKEN = '\033[E'
 BLANK_LINE_TOKEN = '\n'
 END_OF_LINE_TOKEN = '\033[K'
+
+MEGABYTE = 1 << 20
+GIGABYTE = 1 << 30
+
+# ==============================
+# 🧵 POOL DE THREADS
+# ==============================
+
+def worker():
+    return # Função placeholder para threads
+
+threads_pool: list[threading.Thread] = [threading.Thread(target=worker) for _ in range(NUM_THREADS)]
 
 # ==============================
 # 🧩 FUNÇÕES AUXILIARES
@@ -90,10 +102,12 @@ def term_width():
 def signal_handler_progress_bar(sig, frame):
     global RETURN_TOKEN, LINE_BELOW_TOKEN, BLANK_LINE_TOKEN
 
-    # Join nas outras threads
+    signal.signal(signal.SIGINT, signal.SIG_DFL)  # Restaura comportamento padrão
+
     for thread in threading.enumerate():
         if thread is not threading.current_thread():
-            thread.join()
+            if thread.is_alive():
+                thread.join()
 
     print(LINE_BELOW_TOKEN)  # Move para a linha abaixo da barra
 
@@ -114,6 +128,9 @@ def progress_bar(current, total, verbose_text="", finished=False):
 
     if not VERBOSE:
         return
+    
+    if threading.current_thread() is not threading.main_thread():
+        return  # Apenas a thread principal deve atualizar a barra
 
     # Ajusta o tamanho do terminal
     BLANK_LINE_TOKEN = ' ' * ((os.get_terminal_size().columns - 1) + 1) + '\n'
@@ -275,8 +292,6 @@ def handle_fruits360_structure(raw_dir, unified_dir):
     i = 0
     progress_bar(i, total_files, verbose_text="[...] Processing Fruits360 structure")
 
-    threads: list[threading.Thread] = [threading.Thread()] * NUM_THREADS
-
     def worker(split: str, cls: str, src_dir: str):
         nonlocal i
         target_cls_path = os.path.join(unified_dir, cls)
@@ -308,16 +323,16 @@ def handle_fruits360_structure(raw_dir, unified_dir):
             if not os.path.isdir(cls_path):
                 continue
 
-            while threads[t].is_alive():
-                t = (t + 1) % NUM_THREADS
-                time.sleep(0.001)  # Evita busy-waiting intenso
+            while threads_pool[t].is_alive():
+                threads_pool[t].join()
 
-            threads[t] = threading.Thread(target=worker, args=(split, cls, cls_path))
-            threads[t].start()
+            threads_pool[t] = threading.Thread(target=worker, args=(split, cls, cls_path))
+            threads_pool[t].start()
             t = (t + 1) % NUM_THREADS
 
-    for thread in threads:
-        thread.join()
+    for thread in threads_pool:
+        if thread.is_alive():
+            thread.join()
 
     progress_bar(total_files, total_files, verbose_text="[✓] Finished Fruits360 unification", finished=True)
     print(f"Fruits360 structure unified in: {unified_dir}")
@@ -363,61 +378,68 @@ def handle_pklot_structure(raw_dir, unified_dir):
             return False
         return True
 
-    def iter_pklot_images(base_dir: str):
-        """Itera sobre todas as imagens e classes na estrutura segmentada do PKLot.
-
-        Otimizada para reduzir chamadas aninhadas de os.listdir e verificações Python.
-        """
-        if not os.path.isdir(base_dir):
-            return
-
-        valid_exts = (".jpg", ".jpeg", ".png", ".bmp")
-
-        # Ex.: .../PKLotSegmented/PUC/Cloudy/2012-09-12/Empty/img.jpg
-        for root, dirs, files in os.walk(base_dir):
-            # Classes são exatamente os diretórios 'Empty' e 'Occupied'
-            base = os.path.basename(root)
-            if base not in ("Empty", "Occupied"):
-                continue
-
-            cls = base
-            for fname in files:
-                if not fname.lower().endswith(valid_exts):
-                    continue
-                yield cls, os.path.join(root, fname)
-
     def collect_pklot_images_threaded(base_dir: str) -> list[tuple[str, str]]:
-        """Varre PKLotSegmented em paralelo por câmera e retorna (cls, path)."""
+        """Percorre a arvore do PKLot em paralelo e materializa (classe, caminho)."""
+
         if not os.path.isdir(base_dir):
             return []
 
-        cameras = [
-            d for d in os.listdir(base_dir)
-            if os.path.isdir(os.path.join(base_dir, d))
-        ]
-        if not cameras:
-            return list(iter_pklot_images(base_dir))
+        target_classes = ("Empty", "Occupied")
+        valid_exts = (".jpg", ".jpeg", ".png", ".bmp")
 
-        results: list[list[tuple[str, str]]] = [[] for _ in cameras]
-        threads_local: list[threading.Thread] = []
+        # Limita o número de partições iniciais ao número de threads disponíveis
+        partitions = [entry.path for entry in os.scandir(base_dir) if entry.is_dir()]
+        if not partitions:
+            partitions = [base_dir]
+        partitions.sort()
 
-        def worker(cam_idx: int, cam_name: str):
-            cam_root = os.path.join(base_dir, cam_name)
-            for cls, path in iter_pklot_images(cam_root):
-                results[cam_idx].append((cls, path))
+        num_workers = min(NUM_THREADS, len(partitions)) or 1
+        buckets: list[list[tuple[str, str]]] = [[] for _ in range(num_workers)]
 
-        for idx, cam in enumerate(cameras):
-            t_local = threading.Thread(target=worker, args=(idx, cam), daemon=True)
-            threads_local.append(t_local)
-            t_local.start()
+        def collect_from_class_dir(cls_name: str, class_path: str, bucket: list[tuple[str, str]]):
+            try:
+                with os.scandir(class_path) as imgs:
+                    for img_entry in imgs:
+                        if not img_entry.is_file(follow_symlinks=False):
+                            continue
+                        if not img_entry.name.lower().endswith(valid_exts):
+                            continue
+                        bucket.append((cls_name, img_entry.path))
+            except FileNotFoundError:
+                return
 
-        for t_local in threads_local:
-            t_local.join()
+        def walk_partition(partition_path: str, bucket: list[tuple[str, str]]):
+            stack = [partition_path]
+            while stack:
+                current = stack.pop()
+                try:
+                    with os.scandir(current) as entries:
+                        for entry in entries:
+                            if not entry.is_dir(follow_symlinks=False):
+                                continue
+                            name = entry.name
+                            if name in target_classes:
+                                collect_from_class_dir(name, entry.path, bucket)
+                            else:
+                                stack.append(entry.path)
+                except FileNotFoundError:
+                    continue
 
-        merged: list[tuple[str, str]] = []
-        for chunk in results:
-            merged.extend(chunk)
-        return merged
+        def collector(worker_id: int):
+            bucket = buckets[worker_id]
+            for idx in range(worker_id, len(partitions), num_workers):
+                walk_partition(partitions[idx], bucket)
+
+        collector_threads = [threading.Thread(target=collector, args=(worker_id,), name=f"pklot-collector-{worker_id}") for worker_id in range(num_workers)]
+        for thread in collector_threads:
+            thread.start()
+        for thread in collector_threads:
+            thread.join()
+
+        collected: list[tuple[str, str]] = []
+        for bucket in buckets:
+            collected.extend(bucket)
+        return collected
 
     os.makedirs(unified_dir, exist_ok=True)
 
@@ -426,7 +448,7 @@ def handle_pklot_structure(raw_dir, unified_dir):
     if not os.path.isdir(segmented_root):
         segmented_root = raw_dir  # fallback: já está em PKLotSegmented
 
-    # Coleta todos os caminhos em paralelo (câmeras em threads)
+    # Coleta todos os caminhos brutos em paralelo
     all_items = collect_pklot_images_threaded(segmented_root)
     total_files = len(all_items)
 
@@ -441,34 +463,29 @@ def handle_pklot_structure(raw_dir, unified_dir):
     i = 0
     progress_bar(i, total_files, verbose_text="[...] Processing PKLot structure")
 
-    # Threads simples: cada thread processa um lote de caminhos
-    threads: list[threading.Thread] = [threading.Thread()] * NUM_THREADS
-
-    def worker(cls_name: str, src_path: str):
+    def worker(cls_name: str, src_path: str, unified_dir: str):
         nonlocal i
-        target_cls_path = os.path.join(unified_dir, cls_name)
-        os.makedirs(target_cls_path, exist_ok=True)
-
         fname = os.path.basename(src_path)
+        target_cls_path = os.path.join(unified_dir, cls_name)
         dst_file = os.path.join(target_cls_path, fname)
         if os.path.exists(dst_file):
             dst_file = create_new_filename(dst_file)
-
         os.symlink(os.path.abspath(src_path), dst_file)
         i += 1
         progress_bar(i, total_files, verbose_text=f"[✓] Processed: {fname} -> {dst_file}")
-
+        
     t = 0
     for cls_name, src_path in all_items:
-        while threads[t].is_alive():
-            t = (t + 1) % NUM_THREADS
-            time.sleep(0.001)  # Evita busy-waiting intenso
-        threads[t] = threading.Thread(target=worker, args=(cls_name, src_path))
-        threads[t].start()
+        os.makedirs(os.path.join(unified_dir, cls_name), exist_ok=True)
+        while threads_pool[t].is_alive():
+            threads_pool[t].join()
+        threads_pool[t] = threading.Thread(target=worker, args=(cls_name, src_path, unified_dir))
+        threads_pool[t].start()
         t = (t + 1) % NUM_THREADS
 
-    for thread in threads:
-        thread.join()
+    for thread in threads_pool:
+        if thread.is_alive():
+            thread.join()
 
     progress_bar(total_files, total_files, verbose_text="[✓] Finished PKLot unification", finished=True)
     print(f"PKLot structure unified in: {unified_dir}")
@@ -479,22 +496,42 @@ def load_images_from_folder(root_dir):
     images, labels = [], []
     classes = sorted(os.listdir(root_dir))
 
-    print(f"Classes encontradas: ", end = "")
+    print("Classes encontradas: ", end = "")
     if len(classes) <= 10:
         print(", ".join(classes))
     else:
         print("Total de", len(classes), "classes. Listando as primeiras 10: ", end = "")
         print(", ".join(classes[:10]) + ", ...")
 
-    for idx, cls in enumerate(classes):
+    lock = threading.Lock()
+    def worker(cls: str, idx: int):
+        nonlocal images, labels
         cls_path = os.path.join(root_dir, cls)
         if not os.path.isdir(cls_path):
-            continue
+            return
+        local_images = []
+        local_labels = []
         for fname in os.listdir(cls_path):
             if fname.lower().endswith((".jpg", ".png", ".jpeg", ".bmp")):
                 img_path = os.path.join(cls_path, fname)
-                images.append(img_path)
-                labels.append(idx)
+                local_images.append(img_path)
+                local_labels.append(idx)
+        with lock:
+            images.extend(local_images)
+            labels.extend(local_labels)
+
+    t = 0
+    for idx, cls in enumerate(classes):
+        while threads_pool[t].is_alive():
+            threads_pool[t].join()
+        threads_pool[t] = threading.Thread(target=worker, args=(cls, idx))
+        threads_pool[t].start()
+        t = (t + 1) % NUM_THREADS
+
+    for thread in threads_pool:
+        if thread.is_alive():
+            thread.join()
+
     return images, labels, classes
 
 
@@ -542,137 +579,113 @@ def split_dataset(images, labels, train_ratio: float, val_ratio: float, test_rat
 
     return X_train, X_val, X_test, y_train, y_val, y_test
 
-def transform(image) -> torch.Tensor:
+def transform(image) -> Tensor:
     return TRANSFORM_COMPOSE(image)
 
-def preprocess_images(image_paths, labels, image_size, use_memmap: bool = False, data_memmap=None, label_memmap=None, memmap_start: int = 0):
-    """Aplica transformações básicas e converte para tensor.
+def preprocess_images(image_paths, labels, image_size, use_memmap: bool = False, data_memmap: np.memmap | None=None, label_memmap: np.memmap | None=None, memmap_start: int = 0):
+    """Versão reescrita usando ThreadPoolExecutor, context manager em Image.open e coleta periódica de GC.
 
-    Se use_memmap for True, escreve diretamente nas memmaps numpy fornecidas:
-        - data_memmap: numpy.memmap shape (N, 3, H, W) dtype=np.uint8
-        - label_memmap: numpy.memmap shape (N,) dtype=np.int64
-    Caso contrário, aloca e retorna tensores torch (comportamento anterior).
+    Retorna (data_tensor, label_tensor, idx_errors) quando use_memmap==False.
+    Quando use_memmap==True retorna (None, None, idx_errors).
     """
     total_images = len(image_paths)
     if total_images == 0:
         if use_memmap:
             return None, None, []
         return (
-            torch.empty((0, 3, image_size[0], image_size[1]), dtype=torch.uint8),
-            torch.empty((0,), dtype=torch.long),
+            empty((0, 3, image_size[0], image_size[1]), dtype=uint8_t),
+            empty((0,), dtype=uint64_t),
             [],
         )
 
-    idx_errors: list[int] = []
+    idx_errors = []
     idx_errors_lock = threading.Lock()
+    memmap_lock = threading.Lock()
+    data_tensor: Tensor | None
+    label_tensor: Tensor | None
 
     if not use_memmap:
-        data_tensor: torch.Tensor | None = torch.empty(
-            (total_images, 3, image_size[0], image_size[1]),
-            dtype=torch.uint8,
-        )
-        label_tensor: torch.Tensor | None = torch.empty(
-            (total_images,),
-            dtype=torch.long,
-        )
+        data_tensor = empty((total_images, 3, image_size[0], image_size[1]), dtype=uint8_t)
+        label_tensor = empty((total_images,), dtype=uint64_t)
     else:
         data_tensor = None
         label_tensor = None
-
-    def worker(idx: int, path: str, lbl: int):
-        nonlocal data_tensor, label_tensor, idx_errors
-        try:
-            img = Image.open(path).convert("RGB")
-            tensor = transform(img)
-            if tensor.dim() == 4:
-                tensor = tensor.squeeze(0)
-
-            if use_memmap:
-                if (data_memmap is None) or (label_memmap is None):
-                    raise ValueError("Memmaps não fornecidas para escrita.")
-                # tensor está em uint8; garante dtype ao gravar
-                np_arr = tensor.numpy().astype(np.uint8)
-                data_memmap[memmap_start + idx] = np_arr
-                label_memmap[memmap_start + idx] = int(lbl)
-            else:
-                if data_tensor is None or label_tensor is None:
-                    raise ValueError("Tensores não foram alocados corretamente.")
-                data_tensor[idx].copy_(tensor)
-                label_tensor[idx] = int(lbl)
-
-            img.close()
-            del img, tensor
-        except Exception as e:
-            print(f"Erro ao processar {path}: {e}")
-            if use_memmap:
-                if (data_memmap is None) or (label_memmap is None):
-                    raise ValueError("Memmaps não fornecidas para escrita.")
-                data_memmap[memmap_start + idx].fill(0)
-                label_memmap[memmap_start + idx] = int(lbl)
-            else:
-                if data_tensor is None or label_tensor is None:
-                    raise ValueError("Tensores não foram alocados corretamente.")
-                data_tensor[idx].zero_()
-                label_tensor[idx] = int(lbl)
-            with idx_errors_lock:
-                idx_errors.append(idx)
+        if data_memmap is None or label_memmap is None:
+            raise ValueError("Memmaps não fornecidas para escrita.")
 
     progress_bar(0, total_images, verbose_text="[...] Pré-processando imagens")
 
-    num_workers = min(NUM_THREADS, total_images)
-    threads: list[threading.Thread | None] = [None] * num_workers
-    next_thread = 0
+    def worker(idx: int, path: str, lbl: int):
+        nonlocal data_tensor, label_tensor, data_memmap, label_memmap
+
+        try:
+            # usa context manager para garantir fechamento do arquivo
+            img = decode_image(path)
+            tensor = transform(img)
+
+            if use_memmap:
+                with memmap_lock:
+                    data_memmap[memmap_start + idx] = tensor.numpy() # type: ignore
+                    label_memmap[memmap_start + idx] = int(lbl) # type: ignore
+            else:
+                data_tensor[idx] = tensor # type: ignore
+                label_tensor[idx] = lbl # type: ignore
+            
+            del img
+        except Exception as e:
+            if use_memmap:
+                with memmap_lock:
+                    data_memmap[memmap_start + idx].fill(0) # type: ignore
+                    label_memmap[memmap_start + idx] = lbl # type: ignore
+            else:
+                data_tensor[idx].zero_() # type: ignore
+                label_tensor[idx] = lbl # type: ignore
+            with idx_errors_lock:
+                idx_errors.append(idx)
+
     processed = 0
+    t = 0
 
-    gc.disable()  # Desabilita coleta automática para performance
+    gc.disable()  # Desabilita GC automático para performance
     for idx, (path, lbl) in enumerate(zip(image_paths, labels)):
-        while threads[next_thread] is not None and threads[next_thread].is_alive():
-            next_thread = (next_thread + 1) % num_workers
-            time.sleep(0.001)  # Evita busy-waiting intenso
+        while threads_pool[t].is_alive():
+            threads_pool[t].join()
 
-        threads[next_thread] = threading.Thread(
-            target=worker,
-            args=(idx, path, int(lbl)),
-            daemon=True,
+        threads_pool[t] = threading.Thread(
+            target=worker, 
+            args=(idx, path, int(lbl)), 
+            daemon=True
         )
-        threads[next_thread].start()
-
+        threads_pool[t].start()
+        t = (t + 1) % NUM_THREADS
         processed += 1
-        # Atualiza barra apenas a cada 1 imagem (ou na última) para reduzir overhead de I/O
-        if (processed % 1) == 0 or processed == total_images:
-            progress_bar(
-                processed,
-                total_images,
-                verbose_text=f"[✓] Pré-processado: {os.path.basename(path)}",
-            )
-        if (processed % 5000) == 0:
-            gc.collect()
+        progress_bar(processed, total_images, verbose_text=f"[✓] Pré-processado: {os.path.basename(path)}")
 
-        next_thread = (next_thread + 1) % num_workers
+        if processed % 20000 == 0:
+            gc.collect()  # Coleta manual periódica
 
-    gc.enable()  # Reabilita coleta automática após processamento
+    for thread in threads_pool:
+        if thread.is_alive():
+            thread.join()
 
-    for t in threads:
-        if t is not None:
-            t.join()
-    
+    gc.enable()  # Reabilita GC automático após processamento
     progress_bar(total_images, total_images, verbose_text="[✓] Pré-processamento concluído", finished=True)
 
     if idx_errors:
         for index in idx_errors:
             print(f"[!] Imagem com erro no pré-processamento: {image_paths[index]}")
         if not use_memmap:
-            valid_mask = torch.ones(total_images, dtype=torch.bool)
+            valid_mask = ones(total_images, dtype=bool_t)
             for index in idx_errors:
                 valid_mask[index] = False
             if valid_mask.sum().item() == 0:
                 raise RuntimeError("Todas as imagens falharam no pré-processamento.")
             if data_tensor is None or label_tensor is None:
-                raise ValueError("Tensores não foram alocados corretamente.")
+                raise RuntimeError("Tensores não inicializados corretamente.")
             data_tensor = data_tensor[valid_mask]
             label_tensor = label_tensor[valid_mask]
         else:
-            # Se usou memmap, mantemos slots zerados; o chamador pode recompactar depois.
+            # memmap: mantemos slots zerados; o chamador pode recompactar depois.
             pass
 
     if use_memmap:
@@ -699,17 +712,19 @@ def save_split_tensors(splits, output_dir):
     }
 
     for split_name, (images, labels) in splits.items():
+        if images is None or labels is None:
+            continue
         if split_name not in split_to_prefix:
             continue
         prefix = split_to_prefix[split_name]
-        torch.save(images, os.path.join(output_dir, f"{prefix}_images.pt"))
-        torch.save(labels, os.path.join(output_dir, f"{prefix}_labels.pt"))
+        save(images, os.path.join(output_dir, f"{prefix}_images.pt"))
+        save(labels, os.path.join(output_dir, f"{prefix}_labels.pt"))
 
     print(f"Tensores salvos em: {output_dir}")
 
 
 def estimate_split_bytes(num_images: int) -> int:
-    """Estimativa do tamanho em bytes de um split de imagens uint8 (N, 3, H, W)."""
+    """Estimativa do tamanho em bytes de um split de imagens uint8_t (N, 3, H, W)."""
     return num_images * 3 * IMAGE_SIZE[0] * IMAGE_SIZE[1] * 1
 
 
@@ -765,8 +780,8 @@ def build_tensors_memmap(split_name: str, X_split, y_split, output_dir: str):
         data_arr = data_mem
         label_arr = label_mem
 
-    X_tensor = torch.from_numpy(_np.asarray(data_arr)).to(torch.uint8)
-    y_tensor = torch.from_numpy(_np.asarray(label_arr)).long()
+    X_tensor = from_numpy(_np.asarray(data_arr)).to(uint8_t)
+    y_tensor = from_numpy(_np.asarray(label_arr)).long()
     return X_tensor, y_tensor
 
 def process_single_dataset(dataset_name, input_dir, output_dir, unified_dir):
@@ -803,9 +818,9 @@ def process_single_dataset(dataset_name, input_dir, output_dir, unified_dir):
     }
 
     memmap_thresholds = {
-        "train": 1 << 33,  # 8 GiB
-        "val": 1 << 33,    # 8 GiB
-        "test": 1 << 33,   # 8 GiB
+        "train": 1 << 32,  # 4 GiB
+        "val": 1 << 31,    # 2 GiB
+        "test": 1 << 31,   # 2 GiB
     }
 
     tensors = {}
@@ -818,6 +833,7 @@ def process_single_dataset(dataset_name, input_dir, output_dir, unified_dir):
         memmap_flags[split_name] = use_memmap
 
         if use_memmap:
+            print(f"[!] Usando memmap para split '{split_name}' (estimado: {est_bytes / (1 << 20):.2f} MiB)")
             X_tensor, y_tensor = build_tensors_memmap(split_name, X_split, y_split, output_dir)
         else:
             X_tensor, y_tensor = build_tensors_ram(X_split, y_split)
