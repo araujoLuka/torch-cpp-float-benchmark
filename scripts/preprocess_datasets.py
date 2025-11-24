@@ -820,5 +820,4 @@ def process_single_dataset(dataset_name, input_dir, output_dir, unified_dir):
 if __name__ == "__main__":
     # Executa o pipeline para todos os datasets configurados
     for name, in_dir, uni_dir, out_dir in zip(DATASET_NAMES, INPUT_DIRS, UNIFIED_DIRS, OUTPUT_DIRS):
-        if name == "PKLot": continue  # Pula PKLot por enquanto
         process_single_dataset(name, in_dir, out_dir, uni_dir)
