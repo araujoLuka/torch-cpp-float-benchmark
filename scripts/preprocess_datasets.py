@@ -21,7 +21,7 @@ from sklearn.model_selection import train_test_split
 from torch import Tensor, empty, save, from_numpy, ones, manual_seed
 from torch import uint8 as uint8_t, long as uint64_t, bool as bool_t
 from torchvision.transforms import v2
-from torchvision.io import decode_image
+from torchvision.io import decode_image, ImageReadMode
 
 # ==============================
 # 🔧 CONFIGURAÇÕES DO SCRIPT
@@ -67,6 +67,14 @@ np.random.seed(SEED)
 VERBOSE = True
 
 NUM_THREADS: int = 4
+
+# Proporção do dataset a ser usada (1.0 = 100%).
+# Útil para gerar versões menores, rápidas, para testes.
+DATASET_USAGE: float = 1.0
+
+# Se True, força o uso de memmap para todos os splits
+# (desde que o código de memmap esteja habilitado para aquele split).
+FORCE_MEMMAP: bool = False
 
 TRANSFORM_COMPOSE = v2.Compose([
     v2.Resize(IMAGE_SIZE, interpolation=v2.InterpolationMode.BILINEAR, antialias=True),
@@ -129,9 +137,6 @@ def progress_bar(current, total, verbose_text="", finished=False):
     if not VERBOSE:
         return
     
-    if threading.current_thread() is not threading.main_thread():
-        return  # Apenas a thread principal deve atualizar a barra
-
     # Ajusta o tamanho do terminal
     BLANK_LINE_TOKEN = ' ' * ((os.get_terminal_size().columns - 1) + 1) + '\n'
 
@@ -208,18 +213,19 @@ def increment_fruits_file_index(dst_file):
     index_part = parts[-2]           # Parte do indice
     size_part = parts[-1]            # Parte do tamanho (100)
     
-    try:
-        index = int(index_part)
-    except ValueError:
-        return create_new_filename(dst_file)  # Formato inesperado, cria novo nome
-
-    index += 1  # Incrementa o indice
+    # Adiciona sufixo indexado em 'size_part'
+    if not '-' in size_part:
+        size_part = f"{size_part}-1"
+    else:
+        size_main, size_idx = size_part.split('-')
+        size_idx = int(size_idx) + 1
+        size_part = f"{size_main}-{size_idx}"
 
     if len(parts) == 3:
         rotation_part = parts[0]     # Parte da rotacao
-        new_base = f"{rotation_part}_{index}_{size_part}"
+        new_base = f"{rotation_part}_{index_part}_{size_part}"
     else:
-        new_base = f"{index}_{size_part}"
+        new_base = f"{index_part}_{size_part}"
     new_file = f"{new_base}{ext}"
 
     return dst_dir + os.sep + new_file
@@ -231,6 +237,33 @@ def get_total_num_of_images_fruits360(split_dir):
         cls_path = os.path.join(split_dir, cls)
         total += len(os.listdir(cls_path))
     return total
+
+def check_if_already_unified(total_files: int, unified_dir: str) -> bool:
+    if not os.path.exists(unified_dir):
+        return False
+    list_dir = os.listdir(unified_dir)
+    if len(list_dir) == 0:
+        return False
+    count_files = 0
+    for cls in list_dir:
+        cls_path = os.path.join(unified_dir, cls)
+        if not os.path.isdir(cls_path):
+            return False
+        for fname in os.listdir(cls_path):
+            if fname.lower().endswith((".jpg", ".png", ".jpeg", ".bmp")):
+                count_files += 1
+    is_valid = total_files == count_files
+    if DATASET_USAGE < 1.0:
+        is_valid = count_files >= int(total_files * DATASET_USAGE)
+    if not is_valid:
+        # Número de arquivos não confere, provavelmente incompleto
+        # Remove a pasta unificada para evitar confusão
+        import shutil
+        shutil.rmtree(unified_dir)
+        os.makedirs(unified_dir, exist_ok=True)
+        return False
+    return True
+    
 
 def handle_fruits360_structure(raw_dir, unified_dir):
     """Unify Fruits360 structure into a single class-organized directory.
@@ -250,27 +283,6 @@ def handle_fruits360_structure(raw_dir, unified_dir):
                 <symlinked image files from Training and Test>
     """
 
-    def check_if_already_unified(total_files: int) -> bool:
-        if not os.path.exists(unified_dir):
-            return False
-        list_dir = os.listdir(unified_dir)
-        if len(list_dir) == 0:
-            return False
-        count_files = 0
-        for cls in list_dir:
-            cls_path = os.path.join(unified_dir, cls)
-            if not os.path.isdir(cls_path):
-                return False
-            count_files += len(os.listdir(cls_path))
-        if count_files != total_files:
-            # Número de arquivos não confere, provavelmente incompleto
-            # Remove a pasta unificada para evitar confusão
-            import shutil
-            shutil.rmtree(unified_dir)
-            os.makedirs(unified_dir, exist_ok=True)
-            return False
-        return True
-
     os.makedirs(unified_dir, exist_ok=True)
 
     # Count total images for progress bar
@@ -285,7 +297,7 @@ def handle_fruits360_structure(raw_dir, unified_dir):
         print(f"No images found under Fruits360 root: {raw_dir}")
         return
 
-    if check_if_already_unified(total_files):
+    if check_if_already_unified(total_files, unified_dir):
         print(f"Fruits360 structure already unified in: {unified_dir}")
         return
 
@@ -304,9 +316,8 @@ def handle_fruits360_structure(raw_dir, unified_dir):
                 if split == "Training":
                     os.remove(dst_file)
                 else:
-                    dst_file = increment_fruits_file_index(dst_file)
-                    if os.path.exists(dst_file):
-                        os.remove(dst_file)
+                    while os.path.exists(dst_file):
+                        dst_file = increment_fruits_file_index(dst_file)
 
             os.symlink(os.path.abspath(src_file), dst_file)
             i += 1
@@ -357,89 +368,29 @@ def handle_pklot_structure(raw_dir, unified_dir):
                 <symlinked image files>
     """
 
-    def check_if_already_unified(total_files: int) -> bool:
-        if not os.path.exists(unified_dir):
-            return False
-        list_dir = os.listdir(unified_dir)
-        if len(list_dir) == 0:
-            return False
-        count_files = 0
-        for cls in list_dir:
-            cls_path = os.path.join(unified_dir, cls)
-            if not os.path.isdir(cls_path):
-                return False
-            count_files += len(os.listdir(cls_path))
-        if count_files != total_files:
-            # Número de arquivos não confere, provavelmente incompleto
-            # Remove a pasta unificada para evitar confusão
-            import shutil
-            shutil.rmtree(unified_dir)
-            os.makedirs(unified_dir, exist_ok=True)
-            return False
-        return True
-
-    def collect_pklot_images_threaded(base_dir: str) -> list[tuple[str, str]]:
-        """Percorre a arvore do PKLot em paralelo e materializa (classe, caminho)."""
-
-        if not os.path.isdir(base_dir):
-            return []
-
-        target_classes = ("Empty", "Occupied")
-        valid_exts = (".jpg", ".jpeg", ".png", ".bmp")
-
-        # Limita o número de partições iniciais ao número de threads disponíveis
-        partitions = [entry.path for entry in os.scandir(base_dir) if entry.is_dir()]
-        if not partitions:
-            partitions = [base_dir]
-        partitions.sort()
-
-        num_workers = min(NUM_THREADS, len(partitions)) or 1
-        buckets: list[list[tuple[str, str]]] = [[] for _ in range(num_workers)]
-
-        def collect_from_class_dir(cls_name: str, class_path: str, bucket: list[tuple[str, str]]):
-            try:
-                with os.scandir(class_path) as imgs:
-                    for img_entry in imgs:
-                        if not img_entry.is_file(follow_symlinks=False):
-                            continue
-                        if not img_entry.name.lower().endswith(valid_exts):
-                            continue
-                        bucket.append((cls_name, img_entry.path))
-            except FileNotFoundError:
-                return
-
-        def walk_partition(partition_path: str, bucket: list[tuple[str, str]]):
-            stack = [partition_path]
-            while stack:
-                current = stack.pop()
-                try:
-                    with os.scandir(current) as entries:
-                        for entry in entries:
-                            if not entry.is_dir(follow_symlinks=False):
-                                continue
-                            name = entry.name
-                            if name in target_classes:
-                                collect_from_class_dir(name, entry.path, bucket)
-                            else:
-                                stack.append(entry.path)
-                except FileNotFoundError:
+    def collect_pklot_images(segmented_root: str):
+        items = []
+        for camera in os.listdir(segmented_root):
+            camera_path = os.path.join(segmented_root, camera)
+            if not os.path.isdir(camera_path):
+                continue
+            for climate in os.listdir(camera_path):
+                climate_path = os.path.join(camera_path, climate)
+                if not os.path.isdir(climate_path):
                     continue
-
-        def collector(worker_id: int):
-            bucket = buckets[worker_id]
-            for idx in range(worker_id, len(partitions), num_workers):
-                walk_partition(partitions[idx], bucket)
-
-        collector_threads = [threading.Thread(target=collector, args=(worker_id,), name=f"pklot-collector-{worker_id}") for worker_id in range(num_workers)]
-        for thread in collector_threads:
-            thread.start()
-        for thread in collector_threads:
-            thread.join()
-
-        collected: list[tuple[str, str]] = []
-        for bucket in buckets:
-            collected.extend(bucket)
-        return collected
+                for date in os.listdir(climate_path):
+                    date_path = os.path.join(climate_path, date)
+                    if not os.path.isdir(date_path):
+                        continue
+                    for cls in os.listdir(date_path):
+                        cls_path = os.path.join(date_path, cls)
+                        if not os.path.isdir(cls_path):
+                            continue
+                        for fname in os.listdir(cls_path):
+                            if fname.lower().endswith((".jpg", ".png", ".jpeg", ".bmp")):
+                                img_path = os.path.join(cls_path, fname)
+                                items.append((cls, img_path))
+        return items
 
     os.makedirs(unified_dir, exist_ok=True)
 
@@ -449,14 +400,14 @@ def handle_pklot_structure(raw_dir, unified_dir):
         segmented_root = raw_dir  # fallback: já está em PKLotSegmented
 
     # Coleta todos os caminhos brutos em paralelo
-    all_items = collect_pklot_images_threaded(segmented_root)
+    all_items = collect_pklot_images(segmented_root)
     total_files = len(all_items)
 
     if total_files == 0:
         print(f"No images found under PKLot root: {segmented_root}")
         return
 
-    if check_if_already_unified(total_files):
+    if check_if_already_unified(total_files, unified_dir):
         print(f"PKLot structure already unified in: {unified_dir}")
         return
 
@@ -503,34 +454,29 @@ def load_images_from_folder(root_dir):
         print("Total de", len(classes), "classes. Listando as primeiras 10: ", end = "")
         print(", ".join(classes[:10]) + ", ...")
 
-    lock = threading.Lock()
-    def worker(cls: str, idx: int):
-        nonlocal images, labels
+    total_images = 0
+    max_idx = -1
+
+    progress_bar(0, len(classes), verbose_text="[...] Carregando imagens e rótulos")
+    for idx, cls in enumerate(classes):
         cls_path = os.path.join(root_dir, cls)
         if not os.path.isdir(cls_path):
-            return
-        local_images = []
-        local_labels = []
+            continue
+        total_found = 0
         for fname in os.listdir(cls_path):
             if fname.lower().endswith((".jpg", ".png", ".jpeg", ".bmp")):
                 img_path = os.path.join(cls_path, fname)
-                local_images.append(img_path)
-                local_labels.append(idx)
-        with lock:
-            images.extend(local_images)
-            labels.extend(local_labels)
+                images.append(img_path)
+                labels.append(idx)
+                max_idx = max(max_idx, idx)
+                total_found += 1
+        progress_bar(idx + 1, len(classes), verbose_text=f"Classe '{cls}': {total_found} imagens carregadas")
+        total_images += total_found
 
-    t = 0
-    for idx, cls in enumerate(classes):
-        while threads_pool[t].is_alive():
-            threads_pool[t].join()
-        threads_pool[t] = threading.Thread(target=worker, args=(cls, idx))
-        threads_pool[t].start()
-        t = (t + 1) % NUM_THREADS
-
-    for thread in threads_pool:
-        if thread.is_alive():
-            thread.join()
+    progress_bar(len(classes), len(classes), verbose_text=f"[✓] Total de imagens carregadas: {total_images}", finished=True)
+    if max_idx + 1 != len(classes):
+        print(f"[!] Aviso: rótulos não são contínuos. Máximo idx={max_idx}, mas {len(classes)} classes encontradas.")  
+        input("Pressione Enter para continuar...")  
 
     return images, labels, classes
 
@@ -598,11 +544,10 @@ def preprocess_images(image_paths, labels, image_size, use_memmap: bool = False,
             [],
         )
 
-    idx_errors = []
-    idx_errors_lock = threading.Lock()
     memmap_lock = threading.Lock()
     data_tensor: Tensor | None
     label_tensor: Tensor | None
+    idx_errors = []
 
     if not use_memmap:
         data_tensor = empty((total_images, 3, image_size[0], image_size[1]), dtype=uint8_t)
@@ -615,33 +560,29 @@ def preprocess_images(image_paths, labels, image_size, use_memmap: bool = False,
 
     progress_bar(0, total_images, verbose_text="[...] Pré-processando imagens")
 
-    def worker(idx: int, path: str, lbl: int):
-        nonlocal data_tensor, label_tensor, data_memmap, label_memmap
+    def open_image(path: str) -> Tensor:
+        img = decode_image(path, mode=ImageReadMode.RGB)
+        tensor: Tensor = transform(img)
+        return tensor
 
-        try:
-            # usa context manager para garantir fechamento do arquivo
-            img = decode_image(path)
-            tensor = transform(img)
+    def worker_memmap(idx: int, path: str, lbl: int):
+        nonlocal data_memmap, label_memmap
 
-            if use_memmap:
-                with memmap_lock:
-                    data_memmap[memmap_start + idx] = tensor.numpy() # type: ignore
-                    label_memmap[memmap_start + idx] = int(lbl) # type: ignore
-            else:
-                data_tensor[idx] = tensor # type: ignore
-                label_tensor[idx] = lbl # type: ignore
-            
-            del img
-        except Exception as e:
-            if use_memmap:
-                with memmap_lock:
-                    data_memmap[memmap_start + idx].fill(0) # type: ignore
-                    label_memmap[memmap_start + idx] = lbl # type: ignore
-            else:
-                data_tensor[idx].zero_() # type: ignore
-                label_tensor[idx] = lbl # type: ignore
-            with idx_errors_lock:
-                idx_errors.append(idx)
+        tensor = open_image(path)
+
+        with memmap_lock:
+            data_memmap[memmap_start + idx] = tensor.numpy() # type: ignore
+            label_memmap[memmap_start + idx] = int(lbl) # type: ignore
+        
+        del tensor
+    
+    def worker_tensor(idx: int, path: str, lbl: int):
+        nonlocal data_tensor, label_tensor
+
+        tensor = open_image(path)
+
+        data_tensor[idx] = tensor # type: ignore
+        label_tensor[idx] = lbl # type: ignore
 
     processed = 0
     t = 0
@@ -652,16 +593,15 @@ def preprocess_images(image_paths, labels, image_size, use_memmap: bool = False,
             threads_pool[t].join()
 
         threads_pool[t] = threading.Thread(
-            target=worker, 
-            args=(idx, path, int(lbl)), 
-            daemon=True
+            target=worker_memmap if use_memmap else worker_tensor,
+            args=(idx, path, lbl)
         )
         threads_pool[t].start()
         t = (t + 1) % NUM_THREADS
         processed += 1
         progress_bar(processed, total_images, verbose_text=f"[✓] Pré-processado: {os.path.basename(path)}")
 
-        if processed % 20000 == 0:
+        if processed % 5000 == 0:
             gc.collect()  # Coleta manual periódica
 
     for thread in threads_pool:
@@ -671,26 +611,27 @@ def preprocess_images(image_paths, labels, image_size, use_memmap: bool = False,
     gc.enable()  # Reabilita GC automático após processamento
     progress_bar(total_images, total_images, verbose_text="[✓] Pré-processamento concluído", finished=True)
 
-    if idx_errors:
-        for index in idx_errors:
-            print(f"[!] Imagem com erro no pré-processamento: {image_paths[index]}")
-        if not use_memmap:
-            valid_mask = ones(total_images, dtype=bool_t)
-            for index in idx_errors:
-                valid_mask[index] = False
-            if valid_mask.sum().item() == 0:
-                raise RuntimeError("Todas as imagens falharam no pré-processamento.")
-            if data_tensor is None or label_tensor is None:
-                raise RuntimeError("Tensores não inicializados corretamente.")
-            data_tensor = data_tensor[valid_mask]
-            label_tensor = label_tensor[valid_mask]
-        else:
-            # memmap: mantemos slots zerados; o chamador pode recompactar depois.
-            pass
-
-    if use_memmap:
-        return None, None, idx_errors
-    return data_tensor, label_tensor, idx_errors
+    # Valida as labels invalidas
+    num_classes = 0 
+    if "PKLot" in image_paths[0]:
+        num_classes = 2
+    elif "Fruits360" in image_paths[0]:
+        num_classes = 225
+    if not use_memmap and label_tensor is not None:
+        for idx in range(total_images):
+            lbl = label_tensor[idx].item()
+            if lbl < 0 or lbl >= num_classes:
+                idx_errors.append(idx)
+        if len(idx_errors) > 0:
+            print(f"[!] Aviso: {len(idx_errors)} rótulos inválidos encontrados e serão removidos.")
+            input("Pressione Enter para continuar...")
+        valid_mask = ones((total_images,), dtype=bool_t)
+        for idx in idx_errors:
+            valid_mask[idx] = False
+        data_tensor = data_tensor[valid_mask]  # type: ignore
+        label_tensor = label_tensor[valid_mask]  # type: ignore
+    
+    return data_tensor, label_tensor
 
 
 def save_split_tensors(splits, output_dir):
@@ -730,8 +671,7 @@ def estimate_split_bytes(num_images: int) -> int:
 
 def build_tensors_ram(X_split, y_split):
     """Pré-processa um split inteiro em RAM, retornando tensores torch."""
-    X_tensor, y_tensor, _ = preprocess_images(X_split, y_split, IMAGE_SIZE)
-    return X_tensor, y_tensor
+    return preprocess_images(X_split, y_split, IMAGE_SIZE)
 
 
 def build_tensors_memmap(split_name: str, X_split, y_split, output_dir: str):
@@ -740,28 +680,26 @@ def build_tensors_memmap(split_name: str, X_split, y_split, output_dir: str):
     Gera arquivos `<split>_images.memmap` e `<split>_labels.memmap` em `output_dir`.
     Usa `preprocess_images` com `use_memmap=True` para escrever diretamente.
     """
-    import numpy as _np
-
     os.makedirs(output_dir, exist_ok=True)
 
     data_path = os.path.join(output_dir, f"{split_name}_images.memmap")
     label_path = os.path.join(output_dir, f"{split_name}_labels.memmap")
 
     num_images = len(X_split)
-    data_mem = _np.memmap(
+    data_mem = np.memmap(
         data_path,
-        dtype=_np.uint8,
+        dtype=np.uint8,
         mode="w+",
         shape=(num_images, 3, IMAGE_SIZE[0], IMAGE_SIZE[1]),
     )
-    label_mem = _np.memmap(
+    label_mem = np.memmap(
         label_path,
-        dtype=_np.int64,
+        dtype=np.int64,
         mode="w+",
         shape=(num_images,),
     )
 
-    _, _, idx_errors = preprocess_images(
+    _, _ = preprocess_images(
         X_split,
         y_split,
         IMAGE_SIZE,
@@ -771,17 +709,8 @@ def build_tensors_memmap(split_name: str, X_split, y_split, output_dir: str):
         memmap_start=0,
     )
 
-    if idx_errors:
-        mask = _np.ones(num_images, dtype=bool)
-        mask[idx_errors] = False
-        data_arr = data_mem[mask]
-        label_arr = label_mem[mask]
-    else:
-        data_arr = data_mem
-        label_arr = label_mem
-
-    X_tensor = from_numpy(_np.asarray(data_arr)).to(uint8_t)
-    y_tensor = from_numpy(_np.asarray(label_arr)).long()
+    X_tensor = from_numpy(np.asarray(data_mem)).to(uint8_t)
+    y_tensor = from_numpy(np.asarray(label_mem)).long()
     return X_tensor, y_tensor
 
 def process_single_dataset(dataset_name, input_dir, output_dir, unified_dir):
@@ -800,6 +729,17 @@ def process_single_dataset(dataset_name, input_dir, output_dir, unified_dir):
 
     # Após unificar, sempre carregamos a partir de unified_dir
     images, labels, classes = load_images_from_folder(unified_dir)
+
+    # Opcionalmente reduz o tamanho do dataset para testes rápidos
+    if not (0.0 < DATASET_USAGE <= 1.0):
+        raise ValueError("DATASET_USAGE deve estar no intervalo (0, 1].")
+
+    if DATASET_USAGE < 1.0:
+        n_total = len(images)
+        n_keep = max(1, int(n_total * DATASET_USAGE))
+        images = images[:n_keep]
+        labels = labels[:n_keep]
+        print(f"[i] DATASET_USAGE={DATASET_USAGE:.3f} -> usando {n_keep} de {n_total} amostras.")
 
     X_train, X_val, X_test, y_train, y_val, y_test = split_dataset(
         images,
@@ -829,7 +769,7 @@ def process_single_dataset(dataset_name, input_dir, output_dir, unified_dir):
     for split_name, (X_split, y_split) in split_data.items():
         est_bytes = estimate_split_bytes(len(X_split))
         threshold = memmap_thresholds[split_name]
-        use_memmap = est_bytes > threshold
+        use_memmap = est_bytes > threshold or FORCE_MEMMAP
         memmap_flags[split_name] = use_memmap
 
         if use_memmap:
@@ -880,4 +820,5 @@ def process_single_dataset(dataset_name, input_dir, output_dir, unified_dir):
 if __name__ == "__main__":
     # Executa o pipeline para todos os datasets configurados
     for name, in_dir, uni_dir, out_dir in zip(DATASET_NAMES, INPUT_DIRS, UNIFIED_DIRS, OUTPUT_DIRS):
+        if name == "PKLot": continue  # Pula PKLot por enquanto
         process_single_dataset(name, in_dir, out_dir, uni_dir)
