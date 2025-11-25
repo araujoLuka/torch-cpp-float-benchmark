@@ -22,7 +22,8 @@
 #include <unistd.h>
 
 // Project headers
-#include "DatasetMemmap.hpp"
+#include "StreamingDataset.hpp"
+#include "StreamingMemmap.hpp"
 #include "InMemoryTensorDataset.hpp"
 #include "Net.hpp"
 #include "utils/preprocess.hpp"
@@ -277,11 +278,28 @@ static std::unique_ptr<ILoader> make_split_loader(const Args& args, const MetaIn
 
     if (use_memmap)
     {
-        MemmapTensorDataset ds(images_mm.string(), labels_mm.string(), static_cast<size_t>(split_size),
-                               static_cast<size_t>(C), static_cast<size_t>(H), static_cast<size_t>(W),
-                               MemmapTensorDataset::ImageDtype::UINT8);
-        auto map = ds.map(torch::data::transforms::Stack<>());
+        // Aproxima quantos samples cabem em max_ram_mb considerando imagens uint8 + labels int64.
+        const int64_t bytes_per_sample = bytes_for_tensor(1, C, H, W, /*bytes_per_elem=*/1)
+                                       + bytes_for_labels(1, /*bytes_per_elem=*/8);
+        int64_t max_samples = (args.max_ram_mb * 1024LL * 1024LL) / std::max<int64_t>(bytes_per_sample, 1);
+        if (max_samples <= 0) max_samples = 1;
+
+        size_t chunk_size = static_cast<size_t>(std::min<int64_t>(max_samples, split_size));
+
+        auto streaming_ds = StreamingDataset(
+            images_mm.string(),
+            labels_mm.string(),
+            static_cast<size_t>(split_size),
+            static_cast<size_t>(C),
+            static_cast<size_t>(H),
+            static_cast<size_t>(W),
+            chunk_size,
+            /*images_are_float32=*/false);
+
+        streaming_ds.load_initial();
+        auto map = streaming_ds.map(torch::data::transforms::Stack<>());
         auto loader = torch::data::make_data_loader(std::move(map), opts);
+
         using LoaderT = std::remove_reference_t<decltype(*loader)>;
         return std::make_unique<LoaderHolder<LoaderT>>(std::move(loader));
     }
