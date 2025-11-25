@@ -37,7 +37,8 @@ CPMAddPackage(
 # Fontes
 set(SOURCES
     source/main.cpp
-    include/Net.hpp
+    source/DatasetMemmap.cpp
+    source/utils/preprocess.cpp
 )
 
 set(EXEC_NAME "cnn_experiment")
@@ -57,3 +58,5 @@ endif()
 set_property(TARGET ${EXEC_NAME} PROPERTY CXX_STANDARD 17)
 
 list(APPEND CMAKE_PREFIX_PATH "libtorch")
+
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
