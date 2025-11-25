@@ -28,6 +28,15 @@ StreamingMemmap::StreamingMemmap(const std::string& images_path,
         close(img_fd_);
         throw std::runtime_error("Failed to open labels file: " + std::string(strerror(errno)));
     }
+
+    // Tensores estáticos para reutilizar memória entre chunks.
+    // Começam vazios e são redimensionados conforme necessário em load_chunk.
+    if (float32_) {
+        images_buffer_ = torch::empty({0, static_cast<long>(C_), static_cast<long>(H_), static_cast<long>(W_)}, torch::kFloat32);
+    } else {
+        images_buffer_ = torch::empty({0, static_cast<long>(C_), static_cast<long>(H_), static_cast<long>(W_)}, torch::kUInt8);
+    }
+    labels_buffer_ = torch::empty({0}, torch::kInt64);
 }
 
 StreamingMemmap::~StreamingMemmap() {
@@ -59,29 +68,38 @@ void StreamingMemmap::load_chunk(size_t offset, size_t chunk_size, torch::Tensor
         throw std::runtime_error("mmap labels chunk failed: " + std::string(strerror(errno)));
     }
 
-    // Clonar para RAM de forma contígua
-    if (float32_) {
-        images_out = torch::from_blob(
-            img_ptr,
-            { static_cast<long>(chunk_size), static_cast<long>(C_), static_cast<long>(H_), static_cast<long>(W_) },
-            torch::kFloat32
-        ).clone();
-    } else {
-        images_out = torch::from_blob(
-            img_ptr,
-            { static_cast<long>(chunk_size), static_cast<long>(C_), static_cast<long>(H_), static_cast<long>(W_) },
-            torch::kUInt8
-        ).clone();
+    // Garante que os buffers estáticos têm a capacidade correta
+    const auto needed_img_sizes = std::vector<int64_t>{
+        static_cast<int64_t>(chunk_size),
+        static_cast<int64_t>(C_),
+        static_cast<int64_t>(H_),
+        static_cast<int64_t>(W_)
+    };
+
+    if (!images_buffer_.defined() || images_buffer_.sizes() != torch::IntArrayRef(needed_img_sizes)) {
+        if (float32_) {
+            images_buffer_ = torch::empty(needed_img_sizes, torch::kFloat32);
+        } else {
+            images_buffer_ = torch::empty(needed_img_sizes, torch::kUInt8);
+        }
     }
 
-    labels_out = torch::from_blob(
-        lbl_ptr,
-        { static_cast<long>(chunk_size) },
-        torch::kInt64  // labels são uint64 no arquivo, mas LibTorch usa int64
-    ).clone();
+    if (!labels_buffer_.defined() || labels_buffer_.size(0) != static_cast<long>(chunk_size)) {
+        labels_buffer_ = torch::empty({ static_cast<long>(chunk_size) }, torch::kInt64);
+    }
+
+    // Copia diretamente dos mmaps para os buffers reutilizáveis
+    void* img_dest = images_buffer_.data_ptr();
+    std::memcpy(img_dest, img_ptr, img_bytes);
+
+    void* lbl_dest = labels_buffer_.data_ptr();
+    std::memcpy(lbl_dest, lbl_ptr, lbl_bytes);
 
     // libera mmaps temporários
     munmap(img_ptr, img_bytes);
     munmap(lbl_ptr, lbl_bytes);
 
+    // Retorna views dos buffers estáticos
+    images_out = images_buffer_;
+    labels_out = labels_buffer_;
 }

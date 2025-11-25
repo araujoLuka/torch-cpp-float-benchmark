@@ -36,4 +36,7 @@ class StreamingMemmap
     size_t element_size_;
 
     bool float32_;
+        // Buffers estáticos reutilizáveis para reduzir alocações por chunk
+        torch::Tensor images_buffer_;
+        torch::Tensor labels_buffer_;
 };
