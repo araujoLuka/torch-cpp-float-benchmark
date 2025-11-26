@@ -30,3 +30,8 @@ temp/
 
 # Python virtual environments
 Pipfile.lock
+
+# Others
+trash/
+**/logs/
+**/models/
