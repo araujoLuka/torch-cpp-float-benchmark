@@ -23,7 +23,6 @@
 
 // Project headers
 #include "StreamingDataset.hpp"
-#include "StreamingMemmap.hpp"
 #include "InMemoryTensorDataset.hpp"
 #include "Net.hpp"
 #include "utils/preprocess.hpp"
@@ -41,7 +40,7 @@ struct Args
     int64_t seed = 42;
     std::string dtype_arg = "float32";        // float64|float32|float16|bfloat16
     bool use_dropout = false;
-    int64_t max_ram_mb = 2048;                // limite para decidir memmap fallback
+    int64_t max_ram_mb = 4096;                // limite para decidir memmap fallback
     std::string load_model;                   // caminho de Module completo
     std::string load_state;                   // caminho de state_dict
     bool force_cpu = false;                   // se true, usa CPU mesmo se GPU existir
@@ -285,6 +284,7 @@ static std::unique_ptr<ILoader> make_split_loader(const Args& args, const MetaIn
         if (max_samples <= 0) max_samples = 1;
 
         size_t chunk_size = static_cast<size_t>(std::min<int64_t>(max_samples, split_size));
+        chunk_size /= 4; // Por conta dos threads do DataLoader
 
         auto streaming_ds = StreamingDataset(
             images_mm.string(),
@@ -480,7 +480,7 @@ int main(int argc, char** argv)
     // Seed
     torch::manual_seed(args.seed);
     std::srand(static_cast<unsigned>(args.seed));
-    torch::set_num_threads(1);
+    torch::set_num_threads(4);
 
     // Dtype
     auto dtype = parse_dtype(args.dtype_arg);
@@ -505,8 +505,7 @@ int main(int argc, char** argv)
     auto loaders = build_loaders(args, meta, processed_dir);
 
     // Build model
-    std::shared_ptr<Net> model = std::make_shared<Net>(
-        dtype, device, /*in_channels=*/3, /*num_classes=*/meta.num_classes, args.use_dropout, /*base_filters=*/32);
+    std::shared_ptr<Net> model = std::make_shared<Net>(meta.num_classes, dtype, device);
 
     // Load pretrained if provided
     if (!args.load_model.empty())
@@ -563,10 +562,11 @@ int main(int argc, char** argv)
             auto inputs = batch.data.to(device, true);
             auto labels = batch.target.to(device, true).to(torch::kInt64);
 
-            inputs = preprocess_batch(inputs, device, dtype, preprocess_meta);
-
             optimizer.zero_grad();
+
+            inputs = preprocess_batch(inputs, device, dtype, preprocess_meta);
             auto outputs = model->get()->forward(inputs);
+
             auto loss = criterion(outputs, labels);
             loss.backward();
             optimizer.step();
