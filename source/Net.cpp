@@ -41,6 +41,13 @@ NetImpl::NetImpl(int64_t num_classes, torch::Dtype dtype, torch::Device device)
     // Weight initialization (Xavier) and conversion to desired device/dtype
     this->initialize_weights();
     this->to(device, dtype);
+
+    // Network ready. COUT total number of parameters.
+    int64_t total_params = 0;
+    for (const auto& p : this->parameters())
+    { total_params += p.numel(); }
+    std::cout << "[i] Net initialized with " << total_params << " parameters. Device: " << device.str()
+              << ", Dtype: " << dtype << "\n";
 }
 
 // Forward pass: input is [N, C, H, W].
