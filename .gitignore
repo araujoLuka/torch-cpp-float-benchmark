@@ -22,3 +22,16 @@ build/
 
 # Library files
 include/libtorch/
+
+# Dataset files
+datasets/
+data/
+temp/
+
+# Python virtual environments
+Pipfile.lock
+
+# Others
+trash/
+**/logs/
+**/models/
