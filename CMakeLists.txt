@@ -37,6 +37,7 @@ CPMAddPackage(
 # Fontes
 set(SOURCES
     source/main.cpp
+    source/Net.cpp
     source/StreamingMemmap.cpp
     source/utils/preprocess.cpp
 )
