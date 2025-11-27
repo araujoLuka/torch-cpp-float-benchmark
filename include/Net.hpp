@@ -26,9 +26,10 @@ class NetImpl : public torch::nn::Module
     // Fixed architectural constants
     static constexpr char k_default_device[] = "cpu";
     static constexpr int64_t k_input_channels{3};
-    static constexpr int64_t k_conv1_out_channels{64};
-    static constexpr int64_t k_conv2_out_channels{128};
-    static constexpr int64_t k_conv3_out_channels{256};
+    static constexpr int32_t k_base_conv_size{8};
+    static constexpr int64_t k_conv1_out_channels{k_base_conv_size};
+    static constexpr int64_t k_conv2_out_channels{k_base_conv_size * 2};
+    static constexpr int64_t k_conv3_out_channels{k_base_conv_size * 3};
     static constexpr int64_t k_input_image_size{64};
     static constexpr int64_t k_num_pools{3};
     static constexpr int64_t k_final_spatial{k_input_image_size / (1 << k_num_pools)};

@@ -34,9 +34,10 @@ NetImpl::NetImpl(int64_t num_classes, torch::Dtype dtype, torch::Device device)
     // Assumes input images are resized to 64x64 before entering the network.
     // After k_num_pools pooling layers (stride 2 each): 64 / (2^3) = 8, so feature map is 8x8.
     static constexpr int64_t k_flattened_features = k_conv3_out_channels * k_final_spatial * k_final_spatial;
+    static constexpr int64_t k_fc1_out_features = 256;
 
-    this->fc1 = this->register_module("fc1", torch::nn::Linear(k_flattened_features, 256));
-    this->fc2 = this->register_module("fc2", torch::nn::Linear(256, this->num_classes));
+    this->fc1 = this->register_module("fc1", torch::nn::Linear(k_flattened_features, k_fc1_out_features));
+    this->fc2 = this->register_module("fc2", torch::nn::Linear(k_fc1_out_features, this->num_classes));
 
     // Weight initialization (Xavier) and conversion to desired device/dtype
     this->initialize_weights();
