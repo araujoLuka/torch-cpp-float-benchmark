@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 // Project headers
+#include "EarlyStopping.hpp"
 #include "StreamingDataset.hpp"
 #include "InMemoryTensorDataset.hpp"
 #include "Net.hpp"
@@ -34,7 +35,7 @@ struct Args
 {
     std::string dataset;  // obrigatório: Fruits360 | PKLot
     std::string data_root = "./data/datasets";
-    int64_t epochs = 10;
+    int64_t epochs = 30;
     int64_t batch_size = 512;
     double lr = 1e-3;
     int64_t seed = 42;
@@ -443,22 +444,6 @@ static void save_state_dict_json(const Net& model, const std::string& path)
     f << root.dump(2);
 }
 
-static bool stop_condition_met(int64_t epoch, double train_loss, double val_loss, double val_acc)
-{
-    static constexpr float diff_train_val_thresh = 0.005f;
-    static constexpr float min_val_loss = 0.01f;
-    static constexpr int64_t min_epochs = 5;
-    static constexpr float accuracy_thresh = 0.90f;
-
-    if (epoch < min_epochs) return false;
-    if (val_acc < accuracy_thresh) return false;
-    if (val_loss > min_val_loss) return false;
-    if (std::abs(train_loss - val_loss) > diff_train_val_thresh) return false;
-
-    std::cout << "[i] Early stopping condition met at epoch " << epoch << "\n";
-    return true;
-}
-
 // ----------------- Main -----------------
 int main(int argc, char** argv)
 {
@@ -480,7 +465,7 @@ int main(int argc, char** argv)
     // Seed
     torch::manual_seed(args.seed);
     std::srand(static_cast<unsigned>(args.seed));
-    torch::set_num_threads(4);
+    torch::set_num_threads(1);
 
     // Dtype
     auto dtype = parse_dtype(args.dtype_arg);
@@ -549,40 +534,56 @@ int main(int argc, char** argv)
 
     MetaPreprocess preprocess_meta = {.norm_mean = meta.norm_mean, .norm_std = meta.norm_std};
 
+    // Early stopping to avoid overfitting
+    EarlyStopping early_stopping(3);
+
     auto t_start = std::chrono::steady_clock::now();
 
-    for (int64_t epoch = 1; epoch <= args.epochs; ++epoch)
-    {
-        model->get()->train();
-        double epoch_loss_sum = 0.0;
-        int64_t seen = 0;
-
-        for (const auto& batch : *loaders.train_loader)
+    try {
+        for (int64_t epoch = 1; epoch <= args.epochs; ++epoch)
         {
-            auto inputs = batch.data.to(device, true);
-            auto labels = batch.target.to(device, true).to(torch::kInt64);
+            model->get()->train();
+            double epoch_loss_sum = 0.0;
+            int64_t seen = 0;
 
-            optimizer.zero_grad();
+            for (const auto& batch : *loaders.train_loader)
+            {
+                auto inputs = batch.data.to(device, true);
+                auto labels = batch.target.to(device, true).to(torch::kInt64);
 
-            inputs = preprocess_batch(inputs, device, dtype, preprocess_meta);
-            auto outputs = model->get()->forward(inputs);
+                optimizer.zero_grad();
 
-            auto loss = criterion(outputs, labels);
-            loss.backward();
-            optimizer.step();
+                inputs = preprocess_batch(inputs, device, dtype, preprocess_meta);
+                auto outputs = model->get()->forward(inputs);
 
-            epoch_loss_sum += loss.item<double>() * inputs.size(0);
-            seen += inputs.size(0);
+                auto loss = criterion(outputs, labels);
+                loss.backward();
+                optimizer.step();
+
+                epoch_loss_sum += loss.item<double>() * inputs.size(0);
+                seen += inputs.size(0);
+            }
+
+            double train_loss = (seen > 0) ? (epoch_loss_sum / static_cast<double>(seen)) : 0.0;
+            double val_loss = eval_epoch(*model, *loaders.val_loader, criterion, device, dtype, meta, preprocess_meta);
+            double val_acc = eval_accuracy(*model, *loaders.val_loader, device, dtype, meta);
+
+            std::cout 
+                << "Epoch " << std::setw(2) << epoch;
+            std::cout
+                << std::fixed << std::setprecision(6)
+                << " | train_loss=" << train_loss 
+                << " | val_loss=" << val_loss
+                << " | val_acc=" << val_acc << "\n";
+
+            if (epoch != args.epochs && early_stopping(val_loss)) { 
+                std::cout << "[i] Early stopping condition met at epoch " << epoch << "\n";
+                break; 
+            }
         }
-
-        double train_loss = (seen > 0) ? (epoch_loss_sum / static_cast<double>(seen)) : 0.0;
-        double val_loss = eval_epoch(*model, *loaders.val_loader, criterion, device, dtype, meta, preprocess_meta);
-        double val_acc = eval_accuracy(*model, *loaders.val_loader, device, dtype, meta);
-
-        std::cout << "Epoch " << epoch << " | train_loss=" << train_loss << " | val_loss=" << val_loss
-                  << " | val_acc=" << val_acc << "\n";
-
-        if (stop_condition_met(epoch, train_loss, val_loss, val_acc)) { break; }
+    } catch (const std::exception& e) {
+        std::cerr << "[!] Exception during training: " << e.what() << "\n";
+        return 4;
     }
 
     auto t_end = std::chrono::steady_clock::now();
