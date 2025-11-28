@@ -40,7 +40,6 @@ struct Args
     double lr = 1e-3;
     int64_t seed = 42;
     std::string dtype_arg = "float32";        // float64|float32|float16|bfloat16
-    bool use_dropout = false;
     int64_t max_ram_mb = 4096;                // limite para decidir memmap fallback
     std::string load_model;                   // caminho de Module completo
     std::string load_state;                   // caminho de state_dict
@@ -67,7 +66,6 @@ static void print_help()
               << "  --lr             Learning rate (default: 1e-3)\n"
               << "  --dtype          Data type: float64, float32, float16, bfloat16 (default: float32)\n"
               << "  --seed           Random seed (default: 42)\n"
-              << "  --use_dropout    Use dropout layer before fully connected layers\n"
               << "  --max_ram_mb     Max RAM in MB before using memmap fallback (default: 2048)\n"
               << "  --load_model     Path to load full TorchScript Module\n"
               << "  --load_state     Path to load state_dict saved from Python\n"
@@ -89,7 +87,6 @@ static std::optional<Args> parse_args(int argc, char** argv)
         else if (k == "--lr" && need(i)) { a.lr = std::stod(argv[++i]); }
         else if (k == "--dtype" && need(i)) { a.dtype_arg = argv[++i]; }
         else if (k == "--seed" && need(i)) { a.seed = std::stoll(argv[++i]); }
-        else if (k == "--use_dropout") { a.use_dropout = true; }
         else if (k == "--max_ram_mb" && need(i)) { a.max_ram_mb = std::stoll(argv[++i]); }
         else if (k == "--load_model" && need(i)) { a.load_model = argv[++i]; }
         else if (k == "--load_state" && need(i)) { a.load_state = argv[++i]; }
@@ -465,7 +462,7 @@ int main(int argc, char** argv)
     // Seed
     torch::manual_seed(args.seed);
     std::srand(static_cast<unsigned>(args.seed));
-    torch::set_num_threads(1);
+    torch::set_num_threads(4);
 
     // Dtype
     auto dtype = parse_dtype(args.dtype_arg);
@@ -490,7 +487,16 @@ int main(int argc, char** argv)
     auto loaders = build_loaders(args, meta, processed_dir);
 
     // Build model
-    std::shared_ptr<Net> model = std::make_shared<Net>(meta.num_classes, dtype, device);
+    auto model = Net::Impl::create(meta.num_classes, dtype, device);
+
+    // Pretty print device and dtype
+    std::cout << "[i] Network architecture:"
+              << "Input: [3x" << meta.image_h << "x" << meta.image_w << "]"
+              << "Conv[3->8], Pool, Conv[8->16], Pool, Conv[16->24], Pool, FC[1536->256], FC[256->" << meta.num_classes << "]\n";
+    std::cout << "[i] Net initialized with " 
+              << model->get()->total_params << " parameters."
+              << "Device: " << device.str()
+              << ", Dtype: " << dtype << "\n";
 
     // Load pretrained if provided
     if (!args.load_model.empty())
@@ -499,8 +505,6 @@ int main(int argc, char** argv)
         {
             torch::load(*model, args.load_model);
             std::cout << "[i] Loaded full Module from: " << args.load_model << "\n";
-            // Ensure dtype/device set as requested after load
-            model->get()->to_dtype(dtype, device);
         }
         catch (const std::exception& e)
         {
@@ -516,7 +520,6 @@ int main(int argc, char** argv)
             archive.load_from(args.load_state);
             model->get()->load(archive);
             std::cout << "[i] Loaded state_dict from: " << args.load_state << "\n";
-            model->get()->to_dtype(dtype, device);
         }
         catch (const std::exception& e)
         {
