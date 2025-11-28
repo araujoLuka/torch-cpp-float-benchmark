@@ -4,7 +4,7 @@
 # Uso: ./run.sh
 #
 # Will execute the build/cnn_experiment program:
-# Usage: {run.sh_dir}/../build/cnn_experiment --dataset Fruits360|PKLot [--data_root DIR] [--epochs N] [--batch_size N]
+# Usage: ${SCRIPT_DIR}/../build/cnn_experiment --dataset Fruits360|PKLot [--data_root DIR] [--epochs N] [--batch_size N]
 #              [--lr LR] [--dtype float64|float32|float16|bfloat16] [--seed S]
 #              [--use_dropout] [--max_ram_mb MB] [--load_model PATH] [--load_state PATH]
 
@@ -16,7 +16,6 @@
 #   --lr             Learning rate (default: 1e-3)
 #   --dtype          Data type: float64, float32, float16, bfloat16 (default: float32)
 #   --seed           Random seed (default: 42)
-#   --use_dropout    Use dropout layer before fully connected layers
 #   --max_ram_mb     Max RAM in MB before using memmap fallback (default: 2048)
 #   --load_model     Path to load full TorchScript Module
 #   --load_state     Path to load state_dict saved from Python
@@ -27,11 +26,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/../build"
 PROGRAM="${BUILD_DIR}/cnn_experiment"
 DATASETS=("Fruits360" "PKLot")
-DTYPES=( "float32" "float16" "bfloat16" "float64")
-BATCH_SIZES=(256 512 1024 2048) # Tamanhos para rodar com cada dtype (cada dtype deve rodar todos os batch sizes)
+DTYPES=( "float32" "bfloat16" "float64")
+BATCH_SIZES=(256 512 1024) # Tamanhos para rodar com cada dtype (cada dtype deve rodar todos os batch sizes)
 
 # Seed base e número de repetições
-SEED=42
+SEED=45
 RUNS=5
 
 LOGS_DIR="${SCRIPT_DIR}/logs" # Salvar logs de saída para todos os stdout e stderr e informacoes de erro de execução
