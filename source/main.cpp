@@ -491,10 +491,10 @@ int main(int argc, char** argv)
 
     // Pretty print device and dtype
     std::cout << "[i] Network architecture:"
-              << "Input: [3x" << meta.image_h << "x" << meta.image_w << "]"
+              << "Input: [3x" << meta.image_h << "x" << meta.image_w << "] "
               << "Conv[3->8], Pool, Conv[8->16], Pool, Conv[16->24], Pool, FC[1536->256], FC[256->" << meta.num_classes << "]\n";
     std::cout << "[i] Net initialized with " 
-              << model->get()->total_params << " parameters."
+              << model->get()->total_params << " parameters. "
               << "Device: " << device.str()
               << ", Dtype: " << dtype << "\n";
 
