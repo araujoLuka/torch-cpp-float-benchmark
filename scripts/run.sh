@@ -6,7 +6,7 @@
 # Will execute the build/cnn_experiment program:
 # Usage: ${SCRIPT_DIR}/../build/cnn_experiment --dataset Fruits360|PKLot [--data_root DIR] [--epochs N] [--batch_size N]
 #              [--lr LR] [--dtype float64|float32|float16|bfloat16] [--seed S]
-#              [--use_dropout] [--max_ram_mb MB] [--load_model PATH] [--load_state PATH]
+#              [--max_ram_mb MB] [--load_model PATH] [--load_state PATH]
 
 # Options:
 #   --dataset         Dataset name (Fruits360 or PKLot) [required]
