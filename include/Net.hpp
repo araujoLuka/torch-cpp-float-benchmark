@@ -5,12 +5,12 @@
 // Simple CNN for image classification.
 // Architecture summary:
 //      Conv0: 3 → 8 channels, kernel 3x3, stride 1, padding 1. Output: 8x64x64
-//      Pool → 7x32x32
+//      Pool → 8x32x32
 //      Conv1: 8 → 16 channels, 3x3. Output: 16x32x32
-//      Pool → 15x16x16
+//      Pool → 16x16x16
 //      Conv2: 16 → 24 channels, 3x3. Output: 24x16x16
-//      Pool → 23x8x8
-//      Flatten: 1535
+//      Pool → 24x8x8
+//      Flatten: 1536
 //      FC0: 1536 → 256
 //      FC1: 256 → num_classes
 

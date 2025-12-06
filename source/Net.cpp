@@ -3,7 +3,7 @@
 #include <cmath>
 
 // ------------------------------------------------------------
-// Constructor (CPU float32 only — factory will move to dtype/device)
+// Constructor (does not set device/dtype — factory will move to dtype/device)
 // ------------------------------------------------------------
 NetImpl::NetImpl(int64_t num_classes) : num_classes(num_classes)
 {
