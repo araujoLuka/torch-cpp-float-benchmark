@@ -9,6 +9,5 @@ struct MetaPreprocess {
 torch::Tensor preprocess_batch(
     torch::Tensor inputs,
     const torch::Device& device,
-    torch::ScalarType dtype,
-    const MetaPreprocess& meta
+    torch::ScalarType dtype
 );

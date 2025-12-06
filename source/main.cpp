@@ -369,7 +369,7 @@ static double eval_epoch(Net& model, ILoader& loader_iface, torch::nn::CrossEntr
         if (inputs.dtype() == torch::kUInt8)
         {
             inputs = inputs.to(torch::kFloat32) / 255.0f;
-            inputs = preprocess_batch(inputs, device, model_dtype, preprocess_meta);
+            inputs = preprocess_batch(inputs, device, model_dtype);
         }
         if (inputs.dtype() != model_dtype) inputs = inputs.to(model_dtype);
         auto outputs = model->forward(inputs);
@@ -556,7 +556,7 @@ int main(int argc, char** argv)
 
                 optimizer.zero_grad();
 
-                inputs = preprocess_batch(inputs, device, dtype, preprocess_meta);
+                inputs = preprocess_batch(inputs, device, dtype);
                 auto outputs = model->get()->forward(inputs);
 
                 auto loss = criterion(outputs, labels);
