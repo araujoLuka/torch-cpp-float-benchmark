@@ -2,91 +2,93 @@
 
 #include <cmath>
 
-NetImpl::NetImpl(int64_t num_classes, torch::Dtype dtype, torch::Device device)
-    : device{device},
-      dtype{dtype},
-      tensor_options{torch::TensorOptions().device(device).dtype(dtype)},
-      num_classes{num_classes}
+// ------------------------------------------------------------
+// Constructor (does not set device/dtype — factory will move to dtype/device)
+// ------------------------------------------------------------
+NetImpl::NetImpl(int64_t num_classes) : num_classes(num_classes)
 {
-    // Fixed RGB input (3 channels) and explicit channel sizes per layer.
-    // Target pattern: 3 (input RGB) -> 64 -> 128 -> 256.
+    conv1 = register_module(
+        "conv1", torch::nn::Conv2d(torch::nn::Conv2dOptions(k_c_input, k_c_conv1_out, 3).stride(1).padding(1)));
 
-    // Convolution 1: 3 -> 64, 3x3 kernel
-    this->conv1 = this->register_module(
-        "conv1",
-        torch::nn::Conv2d(torch::nn::Conv2dOptions(k_input_channels, k_conv1_out_channels, 3).stride(1).padding(1)));
+    conv2 = register_module(
+        "conv2", torch::nn::Conv2d(torch::nn::Conv2dOptions(k_c_conv1_out, k_c_conv2_out, 3).stride(1).padding(1)));
 
-    // Convolution 2: 64 -> 128, 3x3 kernel
-    this->conv2 = this->register_module(
-        "conv2", torch::nn::Conv2d(
-                     torch::nn::Conv2dOptions(k_conv1_out_channels, k_conv2_out_channels, 3).stride(1).padding(1)));
+    conv3 = register_module(
+        "conv3", torch::nn::Conv2d(torch::nn::Conv2dOptions(k_c_conv2_out, k_c_conv3_out, 3).stride(1).padding(1)));
 
-    // Convolution 3: 128 -> 256, 3x3 kernel
-    this->conv3 = this->register_module(
-        "conv3", torch::nn::Conv2d(
-                     torch::nn::Conv2dOptions(k_conv2_out_channels, k_conv3_out_channels, 3).stride(1).padding(1)));
+    const int64_t conv_params =
+        (k_c_input * k_c_conv1_out * 3 * 3 + k_c_conv1_out) +
+        (k_c_conv1_out * k_c_conv2_out * 3 * 3 + k_c_conv2_out) +
+        (k_c_conv2_out * k_c_conv3_out * 3 * 3 + k_c_conv3_out);
 
-    // 2x2 max pooling and ReLU activation
-    this->pool = torch::nn::MaxPool2d(torch::nn::MaxPool2dOptions(2).stride(2));
-    this->relu = torch::nn::Functional(torch::relu);
+    pool = torch::nn::MaxPool2d(torch::nn::MaxPool2dOptions(2).stride(2));
+    relu = torch::nn::ReLU();
 
-    // Fully connected layers.
-    // Assumes input images are resized to 64x64 before entering the network.
-    // After k_num_pools pooling layers (stride 2 each): 64 / (2^3) = 8, so feature map is 8x8.
-    static constexpr int64_t k_flattened_features = k_conv3_out_channels * k_final_spatial * k_final_spatial;
+    fc1 = register_module("fc1", torch::nn::Linear(k_flattened_features, k_fc1_out_features));
+    fc2 = register_module("fc2", torch::nn::Linear(k_fc1_out_features, num_classes));
 
-    this->fc1 = this->register_module("fc1", torch::nn::Linear(k_flattened_features, 256));
-    this->fc2 = this->register_module("fc2", torch::nn::Linear(256, this->num_classes));
+    const int64_t fc_params =
+        (k_flattened_features * k_fc1_out_features + k_fc1_out_features) +
+        (k_fc1_out_features * num_classes + num_classes);
 
-    // Weight initialization (Xavier) and conversion to desired device/dtype
-    this->initialize_weights();
-    this->to(device, dtype);
+    total_params = conv_params + fc_params;
+
+    initialize_weights();
 }
 
-// Forward pass: input is [N, C, H, W].
+// ------------------------------------------------------------
+// Forward
+// ------------------------------------------------------------
 torch::Tensor NetImpl::forward(torch::Tensor x)
 {
-    // Ensure input matches network dtype (important for FP16/bfloat16).
-    if (x.dtype() != this->dtype) { x = x.to(this->dtype); }
+    TORCH_CHECK(x.dim() == 4, "Input must be [N,C,H,W]. Got: ", x.sizes());
+    TORCH_CHECK(x.size(1) == 3, "Input must have 3 channels.");
+    TORCH_CHECK(x.size(2) == k_input_res && x.size(3) == k_input_res, "Input must be 64x64.");
 
-    // Convolution + ReLU + Pool blocks
-    x = this->relu->forward(this->conv1->forward(x));
-    x = this->pool->forward(x);
+    // ---- Feature extractor ----
+    x = relu(conv1(x));
+    x = pool(x);
 
-    x = this->relu->forward(this->conv2->forward(x));
-    x = this->pool->forward(x);
+    x = relu(conv2(x));
+    x = pool(x);
 
-    x = this->relu->forward(this->conv3->forward(x));
-    x = this->pool->forward(x);
+    x = relu(conv3(x));
+    x = pool(x);
 
-    // Flatten to [N, -1]
+    // ---- Flatten ----
     x = x.view({x.size(0), -1});
 
-    // Fully connected classifier head
-    x = this->relu->forward(this->fc1->forward(x));
-    x = this->fc2->forward(x);  // Logits; apply softmax externally if needed.
+    // ---- Classifier ----
+    x = relu(fc1(x));
+    x = fc2(x);
 
     return x;
 }
 
-// Initialize weights with Xavier initialization, biases to zero.
+// ------------------------------------------------------------
+// Weight initialization: Kaiming for weights, zeros for bias
+// ------------------------------------------------------------
 void NetImpl::initialize_weights()
 {
-    for (auto& pair : this->named_parameters(/*recurse=*/true))
+    for (auto& pair : named_parameters(/*recurse=*/true))
     {
-        auto& param = pair.value();
-        if (param.dim() > 1) { torch::nn::init::xavier_uniform_(param, /*gain=*/std::sqrt(2.0)); }
+        auto& p = pair.value();
+        if (p.dim() > 1) { torch::nn::init::kaiming_uniform_(p, std::sqrt(5.0)); }
         else {
-            torch::nn::init::constant_(param, 0.0);
+            torch::nn::init::constant_(p, 0.0);
         }
     }
 }
 
-// Change network dtype and device after construction.
-void NetImpl::to_dtype(torch::Dtype dtype, torch::Device device)
+// ------------------------------------------------------------
+// Factory: build model → move to dtype/device → return
+// ------------------------------------------------------------
+std::shared_ptr<Net> NetImpl::create(int64_t num_classes, torch::Dtype dtype, torch::Device device)
 {
-    this->dtype = dtype;
-    this->device = device;
-    this->tensor_options = torch::TensorOptions().device(this->device).dtype(this->dtype);
-    this->to(this->device, this->dtype, true);
+    auto model = std::make_shared<Net>(num_classes);
+
+    // Important: call module->to(device, dtype)
+    model->get()->to(device, dtype, true);
+
+    return model;
 }

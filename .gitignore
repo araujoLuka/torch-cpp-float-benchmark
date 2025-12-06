@@ -34,4 +34,4 @@ Pipfile.lock
 # Others
 trash/
 **/logs/
-**/models/
+**/models*/
